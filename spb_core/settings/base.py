@@ -25,7 +25,7 @@ environ.Env.read_env(BASE_DIR / ".env", overwrite=False)
 # Security
 # ---------------------------------------------------------------------------
 
-SECRET_KEY = env("SECRET_KEY", default="changeme-set-SECRET_KEY-in-env")
+SECRET_KEY = env("SECRET_KEY")
 
 DEBUG = env("DEBUG")
 
