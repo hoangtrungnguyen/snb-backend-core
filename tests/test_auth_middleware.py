@@ -2,23 +2,26 @@
 Tests for auth_ext.middleware.JWTAuthMiddleware
 
 Covers:
-- Missing Authorization header → AnonymousUser
-- Malformed header (no Bearer) → AnonymousUser
+- Missing Authorization header → request.user is NOT overwritten (session preserved)
+- Malformed header (no Bearer) → request.user is NOT overwritten (session preserved)
 - Invalid JWT (bad signature) → AnonymousUser
 - Expired JWT → AnonymousUser
 - Valid JWT → request.user is AuthenticatedUser with id, email, role
 - Role extracted from app_metadata.role claim
 - Role defaults to 'user' if claim missing
 - JWKS fetch failure → AnonymousUser (do not raise)
+- JWTError clears the JWKS cache (key rotation support)
+- ValueError/KeyError during decode logged at DEBUG, not EXCEPTION
 """
 
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.contrib.auth.models import AnonymousUser
 from django.test import RequestFactory
 
-from auth_ext.middleware import JWTAuthMiddleware
+from auth_ext.middleware import JWTAuthMiddleware, _fetch_jwks
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -118,25 +121,42 @@ def _make_token(rsa_keypair, kid, payload_overrides=None):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestJWTAuthMiddlewareMissingOrMalformedHeader:
-    """No / bad Authorization header → AnonymousUser."""
+    """No / bad Authorization header → request.user is left untouched."""
 
-    def test_no_auth_header_sets_anonymous(self):
+    def test_no_auth_header_preserves_existing_user(self):
+        """Without a Bearer token the middleware must not overwrite request.user."""
         middleware = JWTAuthMiddleware(_get_response)
         request = _make_request()
+        sentinel = MagicMock(name="session_user")
+        request.user = sentinel
         middleware(request)
-        assert request.user.is_anonymous
+        assert request.user is sentinel
 
-    def test_non_bearer_scheme_sets_anonymous(self):
+    def test_non_bearer_scheme_preserves_existing_user(self):
+        """Basic-auth header is not a Bearer token — leave request.user alone."""
         middleware = JWTAuthMiddleware(_get_response)
         request = _make_request("Basic dXNlcjpwYXNz")
+        sentinel = MagicMock(name="session_user")
+        request.user = sentinel
         middleware(request)
-        assert request.user.is_anonymous
+        assert request.user is sentinel
 
-    def test_bearer_without_token_sets_anonymous(self):
+    def test_bearer_without_token_preserves_existing_user(self):
+        """'Bearer ' (empty token) is not a valid Bearer header — leave user alone."""
         middleware = JWTAuthMiddleware(_get_response)
         request = _make_request("Bearer ")
+        sentinel = MagicMock(name="session_user")
+        request.user = sentinel
         middleware(request)
-        assert request.user.is_anonymous
+        assert request.user is sentinel
+
+    def test_bearer_invalid_token_sets_anonymous(self):
+        """A Bearer header with an invalid JWT still results in AnonymousUser."""
+        with patch("auth_ext.middleware._fetch_jwks", side_effect=Exception("fail")):
+            middleware = JWTAuthMiddleware(_get_response)
+            request = _make_request("Bearer garbage.token.here")
+            middleware(request)
+            assert request.user.is_anonymous
 
 
 class TestJWTAuthMiddlewareInvalidTokens:
@@ -243,3 +263,73 @@ class TestJWTAuthMiddlewareValidToken:
         assert hasattr(user, "is_anonymous")
         assert hasattr(user, "is_authenticated")
         assert user.is_authenticated is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tests for review-round fixes
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestJWTErrorClearsCacheOnKeyRotation:
+    """Finding 1: JWTError must clear the lru_cache so rotated keys are re-fetched."""
+
+    @patch("auth_ext.middleware._fetch_jwks")
+    def test_jwt_error_clears_lru_cache(self, mock_fetch, rsa_keypair, jwks_from_keypair):
+        """After a JWTError, _fetch_jwks.cache_clear() must have been called."""
+        from auth_ext.middleware import _fetch_jwks as real_fetch_jwks
+
+        # Sign token with a different key to force a JWTError on validation.
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+        other_key = rsa.generate_private_key(65537, 2048, default_backend())
+        jwks, kid = jwks_from_keypair
+        mock_fetch.return_value = jwks
+        token = _make_token(other_key, kid)
+
+        with patch.object(real_fetch_jwks, "cache_clear") as mock_clear:
+            request = _make_request(f"Bearer {token}")
+            middleware = JWTAuthMiddleware(_get_response)
+            middleware(request)
+            mock_clear.assert_called_once()
+
+        assert request.user.is_anonymous
+
+
+class TestValueKeyErrorLoggedAtDebug:
+    """Finding 3: ValueError/KeyError during decode must be caught at DEBUG, not EXCEPTION."""
+
+    @patch("auth_ext.middleware._fetch_jwks")
+    def test_value_error_logged_at_debug_not_exception(self, mock_fetch, caplog):
+        """ValueError from malformed token must not produce an EXCEPTION log entry."""
+        import logging
+        from jose import jwt as jose_jwt
+
+        mock_fetch.return_value = {"keys": []}
+
+        # Patch jose_jwt.decode to raise ValueError (malformed base64 etc.)
+        with patch("auth_ext.middleware.jose_jwt.decode", side_effect=ValueError("bad base64")):
+            with caplog.at_level(logging.DEBUG, logger="auth_ext.middleware"):
+                request = _make_request("Bearer anything.goes.here")
+                middleware = JWTAuthMiddleware(_get_response)
+                middleware(request)
+
+        assert request.user.is_anonymous
+        # Must not emit ERROR or higher
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not error_records, "ValueError must not produce ERROR/EXCEPTION log"
+
+    @patch("auth_ext.middleware._fetch_jwks")
+    def test_key_error_logged_at_debug_not_exception(self, mock_fetch, caplog):
+        """KeyError from missing JWKS field must not produce an EXCEPTION log entry."""
+        import logging
+
+        mock_fetch.return_value = {"keys": []}
+
+        with patch("auth_ext.middleware.jose_jwt.decode", side_effect=KeyError("kid")):
+            with caplog.at_level(logging.DEBUG, logger="auth_ext.middleware"):
+                request = _make_request("Bearer anything.goes.here")
+                middleware = JWTAuthMiddleware(_get_response)
+                middleware(request)
+
+        assert request.user.is_anonymous
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not error_records, "KeyError must not produce ERROR/EXCEPTION log"

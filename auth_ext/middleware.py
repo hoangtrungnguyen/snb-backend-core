@@ -117,7 +117,14 @@ def _decode_token(token: str) -> dict | None:
         )
         return claims
     except JWTError as exc:
+        # Clear the JWKS cache so rotated keys are re-fetched on the next request.
+        _fetch_jwks.cache_clear()
         logger.debug("auth_ext: JWT validation failed: %s", exc)
+        return None
+    except (ValueError, KeyError) as exc:
+        # Malformed base64 or missing JWKS fields — log at DEBUG to avoid
+        # leaking token bytes into logs.
+        logger.debug("auth_ext: Malformed token or JWKS structure: %s", type(exc).__name__)
         return None
     except Exception:
         logger.exception("auth_ext: Unexpected error while decoding JWT")
@@ -148,7 +155,11 @@ class JWTAuthMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        request.user = self._authenticate(request)
+        # Only attempt JWT auth when a Bearer token is actually present.
+        # This preserves session-authenticated users set by Django's
+        # AuthenticationMiddleware when no Authorization header is sent.
+        if JWTAuthMiddleware._extract_token(request) is not None:
+            request.user = self._authenticate(request)
         return self.get_response(request)
 
     # ------------------------------------------------------------------
