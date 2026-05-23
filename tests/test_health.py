@@ -1,5 +1,6 @@
 """Tests for the health check endpoint GET /health/."""
 import json
+from unittest.mock import patch
 
 from django.test import TestCase
 
@@ -50,3 +51,11 @@ class HealthCheckTests(TestCase):
         # Must not be a redirect to login or a 401/403
         self.assertNotIn(response.status_code, [301, 302, 401, 403])
         self.assertEqual(response.status_code, 200)
+
+    def test_health_returns_503_when_db_fails(self):
+        """Health endpoint returns HTTP 503 with status 'error' when DB check fails."""
+        with patch("spb_core.views._check_db", return_value="error"):
+            response = self.client.get("/health/")
+        self.assertEqual(response.status_code, 503)
+        data = response.json()
+        self.assertEqual(data["status"], "error")

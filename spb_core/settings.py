@@ -2,15 +2,16 @@
 Django settings for spb_core project.
 """
 
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'django-insecure-5ca=@e4(d=rk3g@!)b0z75%eg85cl21$2vp-_f)-izh%t=_8#e'
+SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
 
-DEBUG = True
+DEBUG = os.environ.get('DJANGO_DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', '').split(',') if not DEBUG else ['*']
 
 INSTALLED_APPS = [
     'django.contrib.admin',

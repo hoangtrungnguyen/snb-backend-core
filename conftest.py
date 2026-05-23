@@ -16,6 +16,8 @@ if REPO_ROOT not in sys.path:
 import django
 from django.conf import settings
 
+os.environ.setdefault('DJANGO_SECRET_KEY', 'test-secret-key-not-for-production')
+
 
 def pytest_configure(config):
     """Configure Django settings for the test suite."""
