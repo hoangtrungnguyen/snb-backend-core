@@ -158,6 +158,26 @@ class TestDockerCompose:
             "web service must specify 'build' or 'image'"
         )
 
+    def test_web_service_has_django_settings_module(self):
+        """gunicorn imports the WSGI module on startup; without DJANGO_SETTINGS_MODULE
+        set, Django falls back to its own internal default which doesn't match this
+        project's layout and the container crashes immediately."""
+        data = self._load()
+        web = data["services"]["web"]
+        env = web.get("environment", {})
+        # environment can be a dict or a list of "KEY=VALUE" strings
+        if isinstance(env, dict):
+            assert "DJANGO_SETTINGS_MODULE" in env, (
+                "web service environment must set DJANGO_SETTINGS_MODULE so "
+                "gunicorn can locate the WSGI app on startup"
+            )
+        else:
+            keys = [entry.split("=")[0] for entry in env]
+            assert "DJANGO_SETTINGS_MODULE" in keys, (
+                "web service environment must set DJANGO_SETTINGS_MODULE so "
+                "gunicorn can locate the WSGI app on startup"
+            )
+
 
 # ---------------------------------------------------------------------------
 # .dockerignore tests

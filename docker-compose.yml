@@ -26,6 +26,9 @@ services:
     environment:
       # Override DATABASE_URL to point at the local db service
       DATABASE_URL: postgres://${POSTGRES_USER:-spb}:${POSTGRES_PASSWORD:-spb_secret}@db:5432/${POSTGRES_DB:-spb_core}
+      # Settings module — use spb_core.settings (flat file) until a settings
+      # package split lands; override with spb_core.settings.prod in prod.
+      DJANGO_SETTINGS_MODULE: spb_core.settings
     ports:
       - "8000:8000"
     depends_on:

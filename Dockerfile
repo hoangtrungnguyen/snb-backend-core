@@ -32,7 +32,10 @@ COPY . .
 
 # Collect static files (may be a no-op without storage backend configured)
 # ENV DJANGO_SETTINGS_MODULE is expected from the runtime environment (.env)
-ENV PYTHONDONTWRITEBYTECODE=1 \
+# Fallback default so the image works standalone; override at runtime for prod
+# (e.g. DJANGO_SETTINGS_MODULE=spb_core.settings.prod once the settings split lands).
+ENV DJANGO_SETTINGS_MODULE=spb_core.settings \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8000
