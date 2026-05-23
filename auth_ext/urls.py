@@ -1,5 +1,6 @@
 from django.urls import path
+from .views import OwnerLoginView
 
-app_name = "auth_ext"
-
-urlpatterns: list = []
+urlpatterns = [
+    path("owner/login", OwnerLoginView.as_view(), name="owner-login"),
+]
