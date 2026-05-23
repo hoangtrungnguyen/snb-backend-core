@@ -239,6 +239,45 @@ class OwnerLoginViewTests(TestCase):
         service_key = getattr(django_settings, "SUPABASE_SERVICE_ROLE_KEY", "")
         self.assertEqual(headers.get("Authorization"), f"Bearer {service_key}")
 
+    def test_role_check_network_failure_returns_503(self):
+        """Network error during role check → 503 service_unavailable (not 403)."""
+        import requests as req_lib
+        auth_resp = self._mock_supabase_success()
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", side_effect=req_lib.RequestException("timeout")):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 503)
+        body = resp.json()
+        self.assertEqual(body.get("error"), "service_unavailable")
+        self.assertIn("Role check failed", body.get("detail", ""))
+
+    def test_role_check_non_list_json_response_returns_403(self):
+        """Supabase returns a dict (error object) instead of a list → 403 forbidden."""
+        auth_resp = self._mock_supabase_success()
+        # Supabase sometimes returns {"message": "..."} on error instead of a list
+        role_resp = MagicMock()
+        role_resp.status_code = 200
+        role_resp.json.return_value = {"message": "JWT expired", "code": "PGRST301"}
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", return_value=role_resp):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 403)
+        body = resp.json()
+        self.assertEqual(body.get("error"), "forbidden")
+        self.assertIn("Owner role required", body.get("detail", ""))
+
     def test_role_check_queries_correct_endpoint(self):
         """Role check must query {SUPABASE_URL}/rest/v1/users with user_id filter."""
         auth_resp = self._mock_supabase_success()

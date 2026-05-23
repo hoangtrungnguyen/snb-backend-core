@@ -46,10 +46,10 @@ class OwnerLoginView(View):
                 timeout=10,
             )
         except requests.RequestException:
-            # If we can't verify the role, deny access.
+            # Network failure — we cannot verify the role; signal upstream error.
             return JsonResponse(
-                {"error": "forbidden", "detail": "Owner role required"},
-                status=403,
+                {"error": "service_unavailable", "detail": "Role check failed"},
+                status=503,
             )
 
         try:
@@ -57,7 +57,7 @@ class OwnerLoginView(View):
         except ValueError:
             rows = []
 
-        if not rows or rows[0].get("role") != "owner":
+        if not isinstance(rows, list) or len(rows) == 0 or rows[0].get("role") != "owner":
             return JsonResponse(
                 {"error": "forbidden", "detail": "Owner role required"},
                 status=403,
