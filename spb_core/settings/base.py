@@ -65,6 +65,9 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # JWT middleware runs after Django's session auth; overrides request.user
+    # when a valid Bearer token is present.
+    "auth_ext.middleware.JWTAuthMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -155,3 +158,14 @@ REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
 }
+
+# ---------------------------------------------------------------------------
+# Supabase / JWT authentication
+# ---------------------------------------------------------------------------
+
+# JWKS endpoint for verifying Supabase-issued JWTs.
+# Format: https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json
+SUPABASE_JWKS_URL = env("SUPABASE_JWKS_URL", default="")
+
+# Expected 'aud' claim in Supabase JWTs (default matches Supabase's default).
+SUPABASE_JWT_AUDIENCE = env("SUPABASE_JWT_AUDIENCE", default="authenticated")
