@@ -15,7 +15,7 @@ import environ
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
-# django-environ — reads from .env if present
+# django-environ — reads .env file if present (does NOT overwrite existing env vars)
 env = environ.Env(
     DEBUG=(bool, False),
 )
@@ -25,6 +25,7 @@ environ.Env.read_env(BASE_DIR / ".env", overwrite=False)
 # Security
 # ---------------------------------------------------------------------------
 
+# SECRET_KEY has no default — raises ImproperlyConfigured if missing from env.
 SECRET_KEY = env("SECRET_KEY")
 
 DEBUG = env("DEBUG")
@@ -91,7 +92,8 @@ WSGI_APPLICATION = "spb_core.wsgi.application"
 ASGI_APPLICATION = "spb_core.asgi.application"
 
 # ---------------------------------------------------------------------------
-# Database
+# Database — loaded from DATABASE_URL env var.
+# Local settings override with SQLite; prod supplies a real DATABASE_URL.
 # ---------------------------------------------------------------------------
 
 DATABASES = {
