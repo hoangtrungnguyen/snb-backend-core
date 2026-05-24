@@ -141,6 +141,9 @@ class PlayersMeView(View):
         except (json.JSONDecodeError, ValueError):
             return JsonResponse({"error": "Invalid JSON body."}, status=400)
 
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
         # Validate full_name
         full_name = body.get("full_name")
         if full_name is None:

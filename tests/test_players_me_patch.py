@@ -70,7 +70,19 @@ class PlayersMePatchTests(TestCase):
         with patch("auth_ext.authentication.jwt.decode") as mock_decode:
             mock_decode.side_effect = Exception("Invalid token")
             resp = self._patch_request({"full_name": "John Doe"}, token="bad.token")
-        self.assertIn(resp.status_code, [401, 403])
+        self.assertEqual(resp.status_code, 401)
+
+    def test_non_player_role_returns_403(self):
+        """PATCH by authenticated user with non-player role (e.g. coach) → 403."""
+        non_player_payload = {
+            "sub": self.user_id,
+            "email": "coach@example.com",
+            "role": "authenticated",
+            "user_metadata": {"role": "coach"},
+        }
+        with patch("auth_ext.authentication.jwt.decode", return_value=non_player_payload):
+            resp = self._patch_request({"full_name": "Coach Name"})
+        self.assertEqual(resp.status_code, 403)
 
     # ------------------------------------------------------------------
     # 400 — invalid body
