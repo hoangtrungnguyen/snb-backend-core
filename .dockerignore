@@ -1,0 +1,52 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Python cache files
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyc
+.Python
+
+# Virtual environments
+.venv
+venv
+env
+
+# Environment / secrets — never include in image
+.env
+*.env
+
+# Grava worktrees
+.worktree
+
+# Grava config
+.grava.yaml
+.grava/
+
+# Test artefacts
+.pytest_cache
+.coverage
+htmlcov/
+runs/
+
+# Editor metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# CI / harness artefacts
+.claude/
+
+# Build artefacts
+*.egg-info
+dist/
+build/

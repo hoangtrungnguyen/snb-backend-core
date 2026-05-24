@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-spb_core}
+      POSTGRES_USER: ${POSTGRES_USER:-spb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spb_secret}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override DATABASE_URL to point at the local db service
+      DATABASE_URL: postgresql://${POSTGRES_USER:-spb}:${POSTGRES_PASSWORD:-spb_secret}@db:5432/${POSTGRES_DB:-spb_core}
+      # Settings module — use spb_core.settings (flat file) until a settings
+      # package split lands; override with spb_core.settings.prod in prod.
+      DJANGO_SETTINGS_MODULE: spb_core.settings
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "python manage.py migrate --no-input &&
+             gunicorn --bind 0.0.0.0:8000 --workers 2 spb_core.wsgi:application"
+
+volumes:
+  pgdata:
