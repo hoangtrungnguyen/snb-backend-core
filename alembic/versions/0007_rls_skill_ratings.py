@@ -14,24 +14,28 @@ Policy summary (Supabase/PostgreSQL RLS):
   - SELECT policy `skill_ratings_select_authenticated`:
       any authenticated user may read skill ratings — open read access.
   - INSERT policy `skill_ratings_insert_court_owner_visited`:
-      authenticated users may insert a skill rating only when both conditions
+      authenticated users may insert a skill rating only when all conditions
       hold for the new row (WITH CHECK):
-        1. auth.uid() is a court owner:
+        1. rated_by = auth.uid() — the row's rated_by column must equal the
+           caller's identity, preventing impersonation of other raters.
+        2. auth.uid() is a court owner:
                auth.uid() IN (SELECT owner_id FROM courts)
-        2. the player being rated (player_id) has visited one of that court
-           owner's courts:
+        3. the player being rated (player_id) has a confirmed/completed booking
+           at one of that court owner's courts:
                player_id IN (
                    SELECT user_id FROM bookings
                    WHERE court_id IN (
                        SELECT id FROM courts WHERE owner_id = auth.uid()
                    )
+                   AND status IN ('confirmed', 'completed')
                )
   - UPDATE policy `skill_ratings_update_court_owner_visited`:
       same constraint as INSERT — both USING (row-access check) and WITH CHECK
       (new-value check) enforce the court-owner + visited-player relationship.
-      A court owner can only update a rating that they originally created for a
-      player who has visited their court, and the updated row must still satisfy
-      the same constraint.
+      rated_by = auth.uid() is included in both clauses to prevent a court
+      owner from updating ratings they did not create or reassigning rated_by to
+      another user. Only confirmed/completed bookings satisfy the "visited"
+      constraint.
 
 Non-qualifying users cannot insert or update skill_ratings — the default-deny
 behaviour of RLS blocks any operation for which no matching policy exists once
@@ -83,9 +87,13 @@ def upgrade() -> None:
     # INSERT: a court owner may rate a player only if that player has actually
     # visited one of the rater's courts (verified via the bookings table).
     #
-    # The WITH CHECK clause enforces two conditions on the new row:
-    #   1. auth.uid() is a court owner in the courts table.
-    #   2. player_id has a booking (visit) at a court owned by auth.uid().
+    # The WITH CHECK clause enforces three conditions on the new row:
+    #   1. rated_by = auth.uid() — the row's rated_by column must equal the
+    #      caller's identity, preventing impersonation of other raters.
+    #   2. auth.uid() is a court owner in the courts table.
+    #   3. player_id has a confirmed/completed booking (visit) at a court owned
+    #      by auth.uid().  Only confirmed or completed bookings count — cancelled
+    #      or pending bookings do not satisfy the "visited" constraint.
     #
     # Because this is an INSERT policy, only WITH CHECK is used — there is no
     # existing row to check with USING.
@@ -96,7 +104,8 @@ def upgrade() -> None:
         FOR INSERT
         TO authenticated
         WITH CHECK (
-            auth.uid() IN (
+            rated_by = auth.uid()
+            AND auth.uid() IN (
                 SELECT owner_id FROM courts
             )
             AND player_id IN (
@@ -104,6 +113,7 @@ def upgrade() -> None:
                 WHERE court_id IN (
                     SELECT id FROM courts WHERE owner_id = auth.uid()
                 )
+                AND status IN ('confirmed', 'completed')
             )
         )
         """
@@ -113,10 +123,11 @@ def upgrade() -> None:
     # rows can be targeted) and WITH CHECK (validates the updated row) enforce
     # the court-owner + visited-player relationship.
     #
-    # This prevents a court owner from:
-    #   - updating ratings they did not create (USING blocks this), or
-    #   - reassigning a rating to a player who hasn't visited their court
-    #     (WITH CHECK blocks this).
+    # rated_by = auth.uid() is added to both USING and WITH CHECK to prevent:
+    #   - a court owner from updating ratings they did not create (USING).
+    #   - a court owner from reassigning rated_by to another user (WITH CHECK).
+    #
+    # Only confirmed/completed bookings satisfy the "visited" constraint.
     op.execute(
         """
         CREATE POLICY skill_ratings_update_court_owner_visited
@@ -124,7 +135,8 @@ def upgrade() -> None:
         FOR UPDATE
         TO authenticated
         USING (
-            auth.uid() IN (
+            rated_by = auth.uid()
+            AND auth.uid() IN (
                 SELECT owner_id FROM courts
             )
             AND player_id IN (
@@ -132,10 +144,12 @@ def upgrade() -> None:
                 WHERE court_id IN (
                     SELECT id FROM courts WHERE owner_id = auth.uid()
                 )
+                AND status IN ('confirmed', 'completed')
             )
         )
         WITH CHECK (
-            auth.uid() IN (
+            rated_by = auth.uid()
+            AND auth.uid() IN (
                 SELECT owner_id FROM courts
             )
             AND player_id IN (
@@ -143,6 +157,7 @@ def upgrade() -> None:
                 WHERE court_id IN (
                     SELECT id FROM courts WHERE owner_id = auth.uid()
                 )
+                AND status IN ('confirmed', 'completed')
             )
         )
         """

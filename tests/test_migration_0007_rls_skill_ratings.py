@@ -238,6 +238,44 @@ class TestUpgradeInsertPolicy:
             f"policy SQL: {combined}"
         )
 
+    def test_insert_policy_enforces_rated_by_equals_auth_uid(self):
+        """INSERT WITH CHECK must enforce rated_by = auth.uid() to prevent impersonation."""
+        sql_stmts = _collect_upgrade_sql()
+        insert_stmts = [
+            s for s in sql_stmts
+            if "CREATE POLICY" in s and "INSERT" in s and "skill_ratings" in s
+        ]
+        combined = " ".join(insert_stmts)
+        assert "rated_by" in combined and "auth.uid()" in combined, (
+            "INSERT policy WITH CHECK must enforce rated_by = auth.uid() to prevent "
+            "a court owner from inserting with an arbitrary rated_by value; "
+            f"policy SQL: {combined}"
+        )
+        # Verify rated_by = auth.uid() appears as a direct equality check, not
+        # only inside a sub-query.
+        assert "rated_by = auth.uid()" in combined, (
+            "INSERT policy must include 'rated_by = auth.uid()' as a top-level "
+            "WITH CHECK condition; "
+            f"policy SQL: {combined}"
+        )
+
+    def test_insert_policy_booking_status_filter(self):
+        """INSERT WITH CHECK bookings sub-query must filter on confirmed/completed status."""
+        sql_stmts = _collect_upgrade_sql()
+        insert_stmts = [
+            s for s in sql_stmts
+            if "CREATE POLICY" in s and "INSERT" in s and "skill_ratings" in s
+        ]
+        combined = " ".join(insert_stmts)
+        assert "status" in combined and (
+            "confirmed" in combined or "completed" in combined
+        ), (
+            "INSERT policy bookings sub-query must filter on booking status "
+            "(confirmed/completed) — cancelled or pending bookings must not satisfy "
+            "the 'visited' constraint; "
+            f"policy SQL: {combined}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # upgrade() — UPDATE policy (court owner who owns a court the player visited)
@@ -332,6 +370,38 @@ class TestUpgradeUpdatePolicy:
         combined = " ".join(update_stmts)
         assert "player_id" in combined, (
             "UPDATE policy must reference player_id when checking visit history; "
+            f"policy SQL: {combined}"
+        )
+
+    def test_update_policy_enforces_rated_by_equals_auth_uid(self):
+        """UPDATE USING and WITH CHECK must enforce rated_by = auth.uid()."""
+        sql_stmts = _collect_upgrade_sql()
+        update_stmts = [
+            s for s in sql_stmts
+            if "CREATE POLICY" in s and "UPDATE" in s and "skill_ratings" in s
+        ]
+        combined = " ".join(update_stmts)
+        assert "rated_by = auth.uid()" in combined, (
+            "UPDATE policy must include 'rated_by = auth.uid()' in both USING and "
+            "WITH CHECK to prevent a court owner from updating another rater's row "
+            "or reassigning rated_by to a different user; "
+            f"policy SQL: {combined}"
+        )
+
+    def test_update_policy_booking_status_filter(self):
+        """UPDATE policy bookings sub-queries must filter on confirmed/completed status."""
+        sql_stmts = _collect_upgrade_sql()
+        update_stmts = [
+            s for s in sql_stmts
+            if "CREATE POLICY" in s and "UPDATE" in s and "skill_ratings" in s
+        ]
+        combined = " ".join(update_stmts)
+        assert "status" in combined and (
+            "confirmed" in combined or "completed" in combined
+        ), (
+            "UPDATE policy bookings sub-queries must filter on booking status "
+            "(confirmed/completed) — cancelled or pending bookings must not satisfy "
+            "the 'visited' constraint; "
             f"policy SQL: {combined}"
         )
 
