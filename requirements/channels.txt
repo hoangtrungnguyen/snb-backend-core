@@ -1,0 +1,6 @@
+# Optional WebSocket / real-time support via Django Channels.
+# Install with: pip install -r requirements/channels.txt
+# After installing, add 'channels' to INSTALLED_APPS and configure
+# CHANNEL_LAYERS in your settings (see Django Channels docs).
+channels>=4.0
+channels-redis>=4.2
