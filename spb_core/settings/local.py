@@ -1,7 +1,8 @@
 """
 Local development settings.
 
-Inherits from base and enables debug mode, relaxed hosts, and SQLite.
+Inherits from base and enables debug mode, relaxed hosts, and SQLite by default.
+Override DATABASE_URL in .env to use a local Postgres instance instead.
 """
 
 from .base import *  # noqa: F401, F403
@@ -10,7 +11,7 @@ DEBUG = True
 
 ALLOWED_HOSTS = ["*"]
 
-# Use SQLite for local development — override DATABASE_URL in .env for Postgres.
+# Use SQLite for local development — set DATABASE_URL in .env for Postgres.
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",

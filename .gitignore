@@ -58,6 +58,9 @@ cover/
 # Django stuff:
 *.log
 local_settings.py
+# Superseded by spb_core/settings/ package — ensure the old monolithic file is
+# never accidentally committed if it still exists in a developer's checkout.
+spb_core/settings.py
 db.sqlite3
 db.sqlite3-journal
 
