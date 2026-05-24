@@ -7,6 +7,13 @@ POST /auth/owner/login
     Validates that the authenticated user has role='owner' in the users table.
     Returns {"access_token": "...", "refresh_token": "...", "user": {...}}
     Pure JWT flow — no Django session/cookie auth.
+
+POST /auth/owner/forgot-password
+    Accepts {"email": "..."}
+    Calls Supabase Auth resetPasswordForEmail (POST /auth/v1/recover)
+    Always returns HTTP 200 {"message": "If that email exists, a reset link has been sent"}
+    Anti-enumeration: response is identical whether email exists or not.
+    Uses SUPABASE_ANON_KEY (not service role key).
 """
 import json
 
@@ -132,3 +139,47 @@ class OwnerLoginView(View):
             {"error": error_data.get("error_description") or error_data.get("error") or "Authentication failed."},
             status=status_code,
         )
+
+
+_RESET_LINK_SENT_MSG = "If that email exists, a reset link has been sent"
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class OwnerForgotPasswordView(View):
+    """Handle POST /auth/owner/forgot-password by delegating to Supabase Auth.
+
+    Always returns HTTP 200 regardless of whether the email exists or whether
+    Supabase itself returns an error — prevents user enumeration attacks.
+    """
+
+    def post(self, request):
+        # Parse JSON body
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        email = body.get("email")
+        if not email:
+            return JsonResponse({"error": "email is required."}, status=400)
+
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+
+        recover_endpoint = f"{supabase_url}/auth/v1/recover"
+
+        try:
+            requests.post(
+                recover_endpoint,
+                json={"email": email},
+                headers={
+                    "apikey": supabase_anon_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException:
+            # Intentionally swallow — anti-enumeration requires always-200
+            pass
+
+        return JsonResponse({"message": _RESET_LINK_SENT_MSG}, status=200)
