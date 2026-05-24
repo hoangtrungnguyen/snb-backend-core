@@ -43,10 +43,12 @@ class OwnerLoginViewTests(TestCase):
     # ------------------------------------------------------------------
 
     def test_login_success_returns_tokens_and_user(self):
-        """Valid credentials → 200 with access_token, refresh_token, user."""
+        """Valid credentials + owner role → 200 with access_token, refresh_token, user."""
         mock_resp = self._mock_supabase_success()
+        role_resp = self._mock_supabase_role_check(role="owner")
 
-        with patch("auth_ext.views.requests.post", return_value=mock_resp) as mock_post:
+        with patch("auth_ext.views.requests.post", return_value=mock_resp), \
+             patch("auth_ext.views.requests.get", return_value=role_resp):
             resp = self.client.post(
                 self.url,
                 data=json.dumps({"email": "owner@example.com", "password": "secret"}),
@@ -65,8 +67,10 @@ class OwnerLoginViewTests(TestCase):
     def test_login_calls_supabase_with_correct_params(self):
         """View must call Supabase auth REST API with email + password."""
         mock_resp = self._mock_supabase_success()
+        role_resp = self._mock_supabase_role_check(role="owner")
 
-        with patch("auth_ext.views.requests.post", return_value=mock_resp) as mock_post:
+        with patch("auth_ext.views.requests.post", return_value=mock_resp) as mock_post, \
+             patch("auth_ext.views.requests.get", return_value=role_resp):
             self.client.post(
                 self.url,
                 data=json.dumps({"email": "owner@example.com", "password": "secret"}),
@@ -146,3 +150,151 @@ class OwnerLoginViewTests(TestCase):
         """GET request → 405 Method Not Allowed."""
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 405)
+
+    # ------------------------------------------------------------------
+    # Role validation (grava-1132.1.2)
+    # ------------------------------------------------------------------
+
+    def _mock_supabase_role_check(self, role=None, empty=False):
+        """Build a mock for the Supabase REST API role-check call."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        if empty:
+            mock_resp.json.return_value = []
+        else:
+            mock_resp.json.return_value = [{"role": role}]
+        return mock_resp
+
+    def test_owner_role_allowed_returns_200(self):
+        """User with role='owner' → login succeeds with 200 and tokens."""
+        auth_resp = self._mock_supabase_success()
+        role_resp = self._mock_supabase_role_check(role="owner")
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", return_value=role_resp):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("access_token", body)
+        self.assertIn("refresh_token", body)
+
+    def test_non_owner_role_returns_403(self):
+        """User with role != 'owner' → 403 forbidden."""
+        auth_resp = self._mock_supabase_success()
+        role_resp = self._mock_supabase_role_check(role="member")
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", return_value=role_resp):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 403)
+        body = resp.json()
+        self.assertEqual(body.get("error"), "forbidden")
+        self.assertIn("Owner role required", body.get("detail", ""))
+
+    def test_user_not_in_users_table_returns_403(self):
+        """User not found in users table → 403 forbidden."""
+        auth_resp = self._mock_supabase_success()
+        role_resp = self._mock_supabase_role_check(empty=True)
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", return_value=role_resp):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 403)
+        body = resp.json()
+        self.assertEqual(body.get("error"), "forbidden")
+        self.assertIn("Owner role required", body.get("detail", ""))
+
+    def test_role_check_uses_service_role_key(self):
+        """Role check must use service-role key (not anon key) for the REST API call."""
+        from django.conf import settings as django_settings
+        auth_resp = self._mock_supabase_success()
+        role_resp = self._mock_supabase_role_check(role="owner")
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", return_value=role_resp) as mock_get:
+            self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        mock_get.assert_called_once()
+        call_kwargs = mock_get.call_args
+        headers = call_kwargs[1].get("headers") or {}
+        service_key = getattr(django_settings, "SUPABASE_SERVICE_ROLE_KEY", "")
+        self.assertEqual(headers.get("Authorization"), f"Bearer {service_key}")
+
+    def test_role_check_network_failure_returns_503(self):
+        """Network error during role check → 503 service_unavailable (not 403)."""
+        import requests as req_lib
+        auth_resp = self._mock_supabase_success()
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", side_effect=req_lib.RequestException("timeout")):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 503)
+        body = resp.json()
+        self.assertEqual(body.get("error"), "service_unavailable")
+        self.assertIn("Role check failed", body.get("detail", ""))
+
+    def test_role_check_non_list_json_response_returns_403(self):
+        """Supabase returns a dict (error object) instead of a list → 403 forbidden."""
+        auth_resp = self._mock_supabase_success()
+        # Supabase sometimes returns {"message": "..."} on error instead of a list
+        role_resp = MagicMock()
+        role_resp.status_code = 200
+        role_resp.json.return_value = {"message": "JWT expired", "code": "PGRST301"}
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", return_value=role_resp):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 403)
+        body = resp.json()
+        self.assertEqual(body.get("error"), "forbidden")
+        self.assertIn("Owner role required", body.get("detail", ""))
+
+    def test_role_check_queries_correct_endpoint(self):
+        """Role check must query {SUPABASE_URL}/rest/v1/users with user_id filter."""
+        auth_resp = self._mock_supabase_success()
+        role_resp = self._mock_supabase_role_check(role="owner")
+
+        with patch("auth_ext.views.requests.post", return_value=auth_resp), \
+             patch("auth_ext.views.requests.get", return_value=role_resp) as mock_get:
+            self.client.post(
+                self.url,
+                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
+        mock_get.assert_called_once()
+        call_args = mock_get.call_args
+        called_url = call_args[0][0] if call_args[0] else call_args[1].get("url", "")
+        self.assertIn("/rest/v1/users", called_url)
+        # user_id from mock is "user-uuid-123"
+        params = call_args[1].get("params") or {}
+        self.assertIn("id", str(params) + called_url)

@@ -4,6 +4,7 @@ auth_ext.views — Authentication views for court owners.
 POST /auth/owner/login
     Accepts {"email": "...", "password": "..."}
     Proxies to Supabase Auth signInWithPassword (POST /auth/v1/token?grant_type=password)
+    Validates that the authenticated user has role='owner' in the users table.
     Returns {"access_token": "...", "refresh_token": "...", "user": {...}}
     Pure JWT flow — no Django session/cookie auth.
 """
@@ -20,6 +21,49 @@ from django.utils.decorators import method_decorator
 @method_decorator(csrf_exempt, name="dispatch")
 class OwnerLoginView(View):
     """Handle POST /auth/owner/login by delegating to Supabase Auth."""
+
+    def _check_owner_role(self, user_id):
+        """
+        Query the users table via Supabase REST API using the service-role key.
+
+        Returns None if the user has role='owner' (check passed).
+        Returns a 403 JsonResponse if the user is not found or has a non-owner role.
+        """
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+        service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
+
+        users_endpoint = f"{supabase_url}/rest/v1/users"
+
+        try:
+            resp = requests.get(
+                users_endpoint,
+                params={"select": "role", "id": f"eq.{user_id}"},
+                headers={
+                    "apikey": service_role_key,
+                    "Authorization": f"Bearer {service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException:
+            # Network failure — we cannot verify the role; signal upstream error.
+            return JsonResponse(
+                {"error": "service_unavailable", "detail": "Role check failed"},
+                status=503,
+            )
+
+        try:
+            rows = resp.json()
+        except ValueError:
+            rows = []
+
+        if not isinstance(rows, list) or len(rows) == 0 or rows[0].get("role") != "owner":
+            return JsonResponse(
+                {"error": "forbidden", "detail": "Owner role required"},
+                status=403,
+            )
+
+        return None
 
     def post(self, request):
         # Parse JSON body
@@ -60,6 +104,14 @@ class OwnerLoginView(View):
 
         if supabase_resp.status_code == 200:
             data = supabase_resp.json()
+
+            # Validate that the authenticated user has role='owner' in the users table.
+            # This check must happen BEFORE returning tokens to the caller.
+            user_id = (data.get("user") or {}).get("id", "")
+            role_check_result = self._check_owner_role(user_id)
+            if role_check_result is not None:
+                return role_check_result
+
             return JsonResponse(
                 {
                     "access_token": data.get("access_token"),
