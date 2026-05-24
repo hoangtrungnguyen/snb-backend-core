@@ -121,14 +121,16 @@ class OwnerLoginView(View):
                 status=200,
             )
 
-        # Supabase returned an error — map to 401 for credential failures
-        try:
-            error_data = supabase_resp.json()
-        except ValueError:
-            error_data = {"error": "Unknown authentication error."}
+        # Supabase returned an error — map any 4xx to a generic 401.
+        # We deliberately do NOT expose Supabase's error_description to prevent
+        # user-enumeration attacks (wrong email vs wrong password must be indistinguishable).
+        if 400 <= supabase_resp.status_code < 500:
+            return JsonResponse(
+                {"error": "invalid_credentials", "detail": "Invalid credentials"},
+                status=401,
+            )
 
-        status_code = 401 if supabase_resp.status_code in (400, 401, 422) else 502
         return JsonResponse(
-            {"error": error_data.get("error_description") or error_data.get("error") or "Authentication failed."},
-            status=status_code,
+            {"error": "Authentication service error.", "detail": "Upstream authentication service returned an error."},
+            status=502,
         )
