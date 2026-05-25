@@ -24,8 +24,11 @@ POST /auth/player/signup
 """
 import json
 import logging
+import math
+import time
 
 import requests
+from django.core.cache import cache
 from django.conf import settings
 from django.http import JsonResponse, HttpResponseRedirect
 from urllib.parse import urlencode
@@ -582,3 +585,86 @@ class PlayerForgotPasswordView(View):
             pass
 
         return JsonResponse({"message": _RESET_LINK_SENT_MSG}, status=200)
+
+
+_RESEND_RATE_LIMIT_SECONDS = 60
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PlayerResendVerificationView(View):
+    """Handle POST /auth/player/resend-verification.
+
+    Re-sends a Supabase signup verification email.  Enforces a 1-per-minute
+    rate limit per email address using Django's cache framework
+    (LocMemCache in dev, Redis-backed in production).
+
+    Cache key: ``resend_verification:{email}``
+    Cache value: Unix timestamp (float) of the last successful send.
+
+    Rate-limit response: 429 {"error": "rate_limited", "retry_after": <seconds>}
+    Success response:    200 {"message": "Verification email sent"}
+
+    Anti-enumeration: Supabase errors (including unknown-email errors) are
+    silently swallowed and still return 200.
+    """
+
+    def post(self, request):
+        # Parse JSON body
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        email = body.get("email", "").strip().lower()
+        if not email:
+            return JsonResponse({"error": "validation_error", "detail": "email is required"}, status=400)
+
+        # --- Rate limit check ---
+        cache_key = f"resend_verification:{email}"
+        last_sent = cache.get(cache_key)
+        if last_sent is not None:
+            elapsed = time.time() - last_sent
+            remaining = _RESEND_RATE_LIMIT_SECONDS - elapsed
+            if remaining > 0:
+                return JsonResponse(
+                    {
+                        "error": "rate_limited",
+                        "retry_after": math.ceil(remaining),
+                    },
+                    status=429,
+                )
+
+        # --- Set rate limit token before calling Supabase ---
+        # Setting it before the network call prevents a race condition where
+        # concurrent requests both slip through before the first one stores it.
+        now = time.time()
+        cache.set(cache_key, now, timeout=_RESEND_RATE_LIMIT_SECONDS)
+
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        app_base_url = getattr(settings, "APP_BASE_URL", "")
+
+        resend_endpoint = f"{supabase_url}/auth/v1/resend"
+        redirect_to = f"{app_base_url}/auth/callback?type=email"
+
+        try:
+            requests.post(
+                resend_endpoint,
+                json={
+                    "type": "signup",
+                    "email": email,
+                    "redirect_to": redirect_to,
+                },
+                headers={
+                    "apikey": supabase_anon_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException:
+            # Intentionally swallow — anti-enumeration requires always-200.
+            # The rate-limit token was already set above; the caller must wait
+            # the full 60 s before retrying regardless of the network outcome.
+            pass
+
+        return JsonResponse({"message": "Verification email sent"}, status=200)
