@@ -7,4 +7,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('health/', health, name='health'),
     path('auth/', include('auth_ext.urls')),
+    path('api/players/', include('players.urls')),
 ]
