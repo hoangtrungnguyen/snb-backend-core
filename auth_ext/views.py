@@ -298,6 +298,65 @@ def _validate_password(password: str) -> dict | None:
     return errors if errors else None
 
 
+def _check_google_oauth_provider(supabase_url: str, service_role_key: str, email: str) -> bool:
+    """
+    Query the Supabase Admin API to check if the given email is linked to a
+    Google OAuth identity provider.
+
+    Returns True if the user has a 'google' provider identity, False otherwise
+    (including on any error — fail-safe: don't disclose more than we must).
+    """
+    if not service_role_key:
+        logger.warning(
+            "SUPABASE_SERVICE_ROLE_KEY not set; cannot check identity provider for email=%s",
+            email,
+        )
+        return False
+
+    admin_endpoint = f"{supabase_url}/auth/v1/admin/users"
+    try:
+        resp = requests.get(
+            admin_endpoint,
+            params={"email": email},
+            headers={
+                "apikey": service_role_key,
+                "Authorization": f"Bearer {service_role_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        logger.error(
+            "Network error querying Supabase admin users API for email=%s: %s",
+            email,
+            exc,
+        )
+        return False
+
+    if resp.status_code != 200:
+        logger.error(
+            "Supabase admin users API returned %s for email=%s",
+            resp.status_code,
+            email,
+        )
+        return False
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.error("Failed to parse Supabase admin users API response for email=%s", email)
+        return False
+
+    users = data.get("users", [])
+    for user in users:
+        identities = user.get("identities") or []
+        for identity in identities:
+            if identity.get("provider") == "google":
+                return True
+
+    return False
+
+
 @method_decorator(csrf_exempt, name="dispatch")
 class PlayerSignupView(View):
     """Handle POST /auth/player/signup by delegating to Supabase Auth signUp."""
@@ -327,6 +386,7 @@ class PlayerSignupView(View):
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
         supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        supabase_service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
 
         signup_endpoint = f"{supabase_url}/auth/v1/signup"
 
@@ -341,9 +401,10 @@ class PlayerSignupView(View):
                 timeout=10,
             )
         except requests.RequestException as exc:
+            logger.error("Network error reaching Supabase signup endpoint: %s", exc)
             return JsonResponse(
-                {"error": "Authentication service unavailable.", "detail": str(exc)},
-                status=502,
+                {"error": "Authentication service unavailable."},
+                status=503,
             )
 
         if supabase_resp.status_code == 200:
@@ -359,22 +420,36 @@ class PlayerSignupView(View):
                 status=201,
             )
 
-        # Supabase 422 means the email is already registered
+        # Supabase 422 means the email is already registered.
+        # Determine whether the existing account uses Google OAuth or email/password.
         if supabase_resp.status_code == 422:
+            has_google = _check_google_oauth_provider(
+                supabase_url, supabase_service_role_key, email
+            )
+            if has_google:
+                return JsonResponse(
+                    {"code": "account_exists_other_provider"},
+                    status=409,
+                )
             return JsonResponse(
                 {"error": "email_already_registered"},
                 status=409,
             )
 
-        # Other Supabase errors
+        # Other Supabase errors — log server-side, return generic message
         try:
             error_data = supabase_resp.json()
         except ValueError:
-            error_data = {"error": "Unknown error from authentication service."}
+            error_data = {}
 
+        logger.error(
+            "Supabase signup returned unexpected status %s: %s",
+            supabase_resp.status_code,
+            error_data,
+        )
         return JsonResponse(
-            {"error": error_data.get("msg") or error_data.get("error") or "Signup failed."},
-            status=502,
+            {"error": "Signup failed."},
+            status=503,
         )
 
 
