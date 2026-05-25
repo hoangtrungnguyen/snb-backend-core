@@ -1,19 +1,19 @@
-"""Tests for migration 0002 — enable RLS on all tables.
+"""Tests for migration 0002 — handle_new_user trigger.
 
 Verifies:
-  - Migration file exists and is importable.
-  - revision / down_revision are correct.
-  - upgrade() emits ALTER TABLE ... ENABLE ROW LEVEL SECURITY for every table.
-  - downgrade() emits ALTER TABLE ... DISABLE ROW LEVEL SECURITY for every table.
-  - No extra RLS policies are created (service-role bypass is Supabase-native).
+  - Migration file exists with correct revision metadata.
+  - upgrade() creates the handle_new_user() PL/pgSQL function.
+  - upgrade() creates the AFTER INSERT trigger on auth.users.
+  - The trigger function body inserts into public.users with role='player'
+    and uses ON CONFLICT DO NOTHING.
+  - downgrade() drops the trigger and the function.
 
-Covers grava-ea77.2.10.
+No live database is required; all assertions use mock patching of alembic.op.
 """
 
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import types
 from pathlib import Path
 
@@ -23,64 +23,35 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 VERSIONS_DIR = Path(__file__).resolve().parents[1] / "alembic" / "versions"
-MIGRATION_PATH = VERSIONS_DIR / "0002_enable_rls.py"
-
-ALL_TABLES = [
-    "users",
-    "courts",
-    "recurrence_rules",
-    "slots",
-    "booking_series",
-    "bookings",
-    "slot_participants",
-    "slot_join_requests",
-    "notifications",
-    "slot_push_log",
-    "skill_ratings",
-]
+MIGRATION_PATH = VERSIONS_DIR / "0002_handle_new_user_trigger.py"
 
 
 def _load_migration() -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location("migration_0002", MIGRATION_PATH)
-    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    """Dynamically import the migration module by file path."""
+    spec = importlib.util.spec_from_file_location(
+        "migration_0002", MIGRATION_PATH
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     return mod
-
-
-def _collect_sql(fn) -> list[str]:
-    """Run fn() with op.execute mocked and return all SQL strings emitted."""
-    import alembic.op as _op_module
-
-    executed: list[str] = []
-    original_execute = getattr(_op_module, "execute", None)
-
-    def fake_execute(sql: str) -> None:
-        executed.append(sql)
-
-    _op_module.execute = fake_execute
-    try:
-        fn()
-    finally:
-        if original_execute is not None:
-            _op_module.execute = original_execute
-
-    return executed
 
 
 # ---------------------------------------------------------------------------
 # Module structure
 # ---------------------------------------------------------------------------
 
-
 class TestMigrationModuleStructure:
     def test_migration_file_exists(self):
-        assert MIGRATION_PATH.exists(), f"Migration file not found at {MIGRATION_PATH}"
+        assert MIGRATION_PATH.exists(), (
+            f"Migration file not found at {MIGRATION_PATH}"
+        )
 
     def test_revision_id(self):
         mod = _load_migration()
         assert mod.revision == "0002"
 
     def test_down_revision(self):
+        """Must chain from 0001."""
         mod = _load_migration()
         assert mod.down_revision == "0001"
 
@@ -94,47 +65,184 @@ class TestMigrationModuleStructure:
 
 
 # ---------------------------------------------------------------------------
-# upgrade() — ENABLE ROW LEVEL SECURITY
+# upgrade() — function creation
 # ---------------------------------------------------------------------------
 
+class TestUpgradeCreatesFunction:
+    """upgrade() must CREATE OR REPLACE the handle_new_user() function."""
 
-class TestUpgradeEnablesRLS:
-    @pytest.mark.parametrize("table", ALL_TABLES)
-    def test_rls_enabled_for_table(self, table: str):
+    def _collect_sql(self) -> list[str]:
         mod = _load_migration()
-        sql_stmts = _collect_sql(mod.upgrade)
-        # Normalise whitespace for matching
-        normalised = [" ".join(s.split()).upper() for s in sql_stmts]
-        expected_fragment = f"ALTER TABLE {table.upper()} ENABLE ROW LEVEL SECURITY"
-        assert any(expected_fragment in s for s in normalised), (
-            f"upgrade() must emit 'ALTER TABLE {table} ENABLE ROW LEVEL SECURITY'; "
-            f"found SQL (normalised): {normalised}"
+        executed: list[str] = []
+
+        import alembic.op as _op_module
+        orig_execute = getattr(_op_module, "execute", None)
+
+        def fake_execute(sql: str) -> None:
+            executed.append(sql)
+
+        _op_module.execute = fake_execute
+        try:
+            mod.upgrade()
+        finally:
+            if orig_execute is not None:
+                _op_module.execute = orig_execute
+
+        return executed
+
+    def test_creates_handle_new_user_function(self):
+        sql_stmts = self._collect_sql()
+        assert any(
+            "handle_new_user" in s and "CREATE" in s for s in sql_stmts
+        ), (
+            "upgrade() must CREATE the handle_new_user() function; "
+            f"found SQL: {sql_stmts}"
         )
 
-    def test_no_create_policy(self):
-        """No RLS policies should be created — service-role bypass is Supabase-native."""
-        mod = _load_migration()
-        sql_stmts = _collect_sql(mod.upgrade)
-        policy_stmts = [s for s in sql_stmts if "CREATE POLICY" in s.upper()]
-        assert not policy_stmts, (
-            f"upgrade() must NOT create RLS policies (service-role bypass is "
-            f"Supabase-native); found: {policy_stmts}"
+    def test_function_inserts_into_public_users(self):
+        sql_stmts = self._collect_sql()
+        combined = "\n".join(sql_stmts).upper()
+        assert "INSERT INTO PUBLIC.USERS" in combined or "INSERT INTO public.users" in "\n".join(sql_stmts), (
+            "handle_new_user function must INSERT INTO public.users; "
+            f"found SQL: {sql_stmts}"
+        )
+
+    def test_function_sets_role_player(self):
+        sql_stmts = self._collect_sql()
+        combined = "\n".join(sql_stmts)
+        assert "player" in combined, (
+            "handle_new_user function must set role = 'player'; "
+            f"found SQL: {sql_stmts}"
+        )
+
+    def test_function_uses_on_conflict_do_nothing(self):
+        sql_stmts = self._collect_sql()
+        combined = "\n".join(sql_stmts).upper()
+        assert "ON CONFLICT DO NOTHING" in combined, (
+            "handle_new_user function must use ON CONFLICT DO NOTHING; "
+            f"found SQL: {sql_stmts}"
         )
 
 
 # ---------------------------------------------------------------------------
-# downgrade() — DISABLE ROW LEVEL SECURITY
+# upgrade() — trigger creation
 # ---------------------------------------------------------------------------
 
+class TestUpgradeCreatesTrigger:
+    """upgrade() must CREATE the AFTER INSERT trigger on auth.users."""
 
-class TestDowngradeDisablesRLS:
-    @pytest.mark.parametrize("table", ALL_TABLES)
-    def test_rls_disabled_for_table(self, table: str):
+    def _collect_sql(self) -> list[str]:
         mod = _load_migration()
-        sql_stmts = _collect_sql(mod.downgrade)
-        normalised = [" ".join(s.split()).upper() for s in sql_stmts]
-        expected_fragment = f"ALTER TABLE {table.upper()} DISABLE ROW LEVEL SECURITY"
-        assert any(expected_fragment in s for s in normalised), (
-            f"downgrade() must emit 'ALTER TABLE {table} DISABLE ROW LEVEL SECURITY'; "
-            f"found SQL (normalised): {normalised}"
+        executed: list[str] = []
+
+        import alembic.op as _op_module
+        orig_execute = getattr(_op_module, "execute", None)
+
+        def fake_execute(sql: str) -> None:
+            executed.append(sql)
+
+        _op_module.execute = fake_execute
+        try:
+            mod.upgrade()
+        finally:
+            if orig_execute is not None:
+                _op_module.execute = orig_execute
+
+        return executed
+
+    def test_creates_trigger(self):
+        sql_stmts = self._collect_sql()
+        assert any(
+            "CREATE TRIGGER" in s and "handle_new_user" in s for s in sql_stmts
+        ), (
+            "upgrade() must CREATE TRIGGER handle_new_user; "
+            f"found SQL: {sql_stmts}"
+        )
+
+    def test_trigger_is_after_insert(self):
+        sql_stmts = self._collect_sql()
+        trigger_sql = next(
+            (s for s in sql_stmts if "CREATE TRIGGER" in s and "handle_new_user" in s),
+            None,
+        )
+        assert trigger_sql is not None, "No CREATE TRIGGER SQL found for handle_new_user"
+        upper = trigger_sql.upper()
+        assert "AFTER INSERT" in upper, (
+            f"Trigger must be AFTER INSERT; got: {trigger_sql!r}"
+        )
+
+    def test_trigger_on_auth_users(self):
+        sql_stmts = self._collect_sql()
+        trigger_sql = next(
+            (s for s in sql_stmts if "CREATE TRIGGER" in s and "handle_new_user" in s),
+            None,
+        )
+        assert trigger_sql is not None, "No CREATE TRIGGER SQL found for handle_new_user"
+        assert "auth.users" in trigger_sql, (
+            f"Trigger must be ON auth.users; got: {trigger_sql!r}"
+        )
+
+    def test_trigger_for_each_row(self):
+        sql_stmts = self._collect_sql()
+        trigger_sql = next(
+            (s for s in sql_stmts if "CREATE TRIGGER" in s and "handle_new_user" in s),
+            None,
+        )
+        assert trigger_sql is not None
+        upper = trigger_sql.upper()
+        assert "FOR EACH ROW" in upper, (
+            f"Trigger must be FOR EACH ROW; got: {trigger_sql!r}"
+        )
+
+    def test_trigger_executes_handle_new_user(self):
+        sql_stmts = self._collect_sql()
+        trigger_sql = next(
+            (s for s in sql_stmts if "CREATE TRIGGER" in s and "handle_new_user" in s),
+            None,
+        )
+        assert trigger_sql is not None
+        upper = trigger_sql.upper()
+        assert "EXECUTE FUNCTION" in upper or "EXECUTE PROCEDURE" in upper, (
+            f"Trigger must EXECUTE FUNCTION handle_new_user(); got: {trigger_sql!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# downgrade() — cleanup
+# ---------------------------------------------------------------------------
+
+class TestDowngrade:
+    """downgrade() must drop the trigger and the function."""
+
+    def _collect_sql(self) -> list[str]:
+        mod = _load_migration()
+        executed: list[str] = []
+
+        import alembic.op as _op_module
+        orig_execute = getattr(_op_module, "execute", None)
+
+        def fake_execute(sql: str) -> None:
+            executed.append(sql)
+
+        _op_module.execute = fake_execute
+        try:
+            mod.downgrade()
+        finally:
+            if orig_execute is not None:
+                _op_module.execute = orig_execute
+
+        return executed
+
+    def test_drops_trigger(self):
+        sql_stmts = self._collect_sql()
+        combined = "\n".join(sql_stmts).upper()
+        assert "DROP TRIGGER" in combined, (
+            f"downgrade() must DROP TRIGGER; found SQL: {sql_stmts}"
+        )
+
+    def test_drops_function(self):
+        sql_stmts = self._collect_sql()
+        combined = "\n".join(sql_stmts).upper()
+        assert "DROP FUNCTION" in combined and "HANDLE_NEW_USER" in combined, (
+            f"downgrade() must DROP FUNCTION handle_new_user; found SQL: {sql_stmts}"
         )
