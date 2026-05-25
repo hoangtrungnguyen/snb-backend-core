@@ -27,7 +27,8 @@ import logging
 
 import requests
 from django.conf import settings
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponseRedirect
+from urllib.parse import urlencode
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
@@ -358,4 +359,73 @@ class PlayerSignupView(View):
         return JsonResponse(
             {"error": error_data.get("msg") or error_data.get("error") or "Signup failed."},
             status=502,
+        )
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class AuthCallbackView(View):
+    """
+    Handle GET /auth/callback — the Supabase email-verification redirect target.
+
+    Two supported flows:
+      - PKCE:       ?code=<code>
+      - token_hash: ?token_hash=<hash>&type=<type>
+
+    On success, redirects to FRONTEND_URL with tokens in URL fragment.
+    On failure returns 400 {"error": "verification_failed"}.
+    """
+
+    _VERIFICATION_FAILED = {"error": "verification_failed"}
+    ALLOWED_TOKEN_TYPES = {"email", "signup", "recovery", "invite"}
+
+    def get(self, request):
+        code = request.GET.get("code")
+        token_hash = request.GET.get("token_hash")
+        token_type = request.GET.get("type")
+
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        headers = {"apikey": supabase_anon_key, "Content-Type": "application/json"}
+
+        try:
+            if code:
+                supabase_resp = requests.post(
+                    f"{supabase_url}/auth/v1/token",
+                    params={"grant_type": "pkce"},
+                    json={"auth_code": code},
+                    headers=headers,
+                    timeout=10,
+                )
+            elif token_hash and token_type:
+                if token_type not in self.ALLOWED_TOKEN_TYPES:
+                    return JsonResponse(
+                        {"error": "verification_failed", "detail": "Invalid token type"},
+                        status=400,
+                    )
+                supabase_resp = requests.post(
+                    f"{supabase_url}/auth/v1/verify",
+                    json={"token_hash": token_hash, "type": token_type},
+                    headers=headers,
+                    timeout=10,
+                )
+            else:
+                return JsonResponse(self._VERIFICATION_FAILED, status=400)
+        except requests.RequestException:
+            return JsonResponse(self._VERIFICATION_FAILED, status=400)
+
+        if supabase_resp.status_code != 200:
+            return JsonResponse(self._VERIFICATION_FAILED, status=400)
+
+        data = supabase_resp.json()
+        access_token = data.get("access_token", "")
+        refresh_token = data.get("refresh_token", "")
+
+        frontend_url = getattr(settings, "FRONTEND_URL", "")
+        if frontend_url:
+            fragment = urlencode({"access_token": access_token, "refresh_token": refresh_token})
+            return HttpResponseRedirect(f"{frontend_url}#{fragment}")
+
+        return JsonResponse(
+            {"status": "verified", "access_token": access_token, "refresh_token": refresh_token},
+            status=200,
         )
