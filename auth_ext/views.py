@@ -475,12 +475,61 @@ def _supabase_token_request(email: str, password: str) -> requests.Response:
 class PlayerLoginView(View):
     """Handle POST /auth/player/login by delegating to Supabase Auth.
 
-    Differences from OwnerLoginView:
-    - Does NOT check for owner role — any role is accepted.
-    - Returns generic 401 {"error": "invalid_credentials"} on bad credentials
-      (no enumeration of whether email or password was wrong).
-    - Still checks email_confirmed_at IS NOT NULL → 403 {"error": "email_not_verified"}.
+    - Validates users.role = 'player' via Supabase REST API (service-role key).
+    - Returns 403 {"error": "forbidden", "detail": "Player role required"} if role check fails.
+    - Returns 503 {"error": "service_unavailable"} on network failure during role check.
+    - Returns generic 401 {"error": "invalid_credentials"} on bad Supabase auth credentials.
+    - Checks email_confirmed_at IS NOT NULL → 403 {"error": "email_not_verified"}.
     """
+
+    def _check_player_role(self, user_id):
+        """
+        Query the users table via Supabase REST API using the service-role key.
+
+        Returns None if the user has role='player' (check passed).
+        Returns a 403 JsonResponse if the user is not found or has a non-player role.
+        Returns a 503 JsonResponse on network failure.
+        """
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+        service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
+
+        users_endpoint = f"{supabase_url}/rest/v1/users"
+
+        try:
+            resp = requests.get(
+                users_endpoint,
+                params={"select": "role", "id": f"eq.{user_id}"},
+                headers={
+                    "apikey": service_role_key,
+                    "Authorization": f"Bearer {service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException:
+            return JsonResponse(
+                {"error": "service_unavailable"},
+                status=503,
+            )
+
+        if not resp.ok:
+            return JsonResponse(
+                {"error": "service_unavailable"},
+                status=503,
+            )
+
+        try:
+            rows = resp.json()
+        except ValueError:
+            rows = []
+
+        if not isinstance(rows, list) or not rows or rows[0].get("role") != "player":
+            return JsonResponse(
+                {"error": "forbidden", "detail": "Player role required"},
+                status=403,
+            )
+
+        return None
 
     def post(self, request):
         # Parse JSON body
@@ -515,6 +564,18 @@ class PlayerLoginView(View):
                     {"error": "email_not_verified"},
                     status=403,
                 )
+
+            # Validate that the authenticated user has role='player' in the users table.
+            # This check must happen BEFORE returning tokens to the caller.
+            user_id = user.get("id")
+            if not user_id:
+                return JsonResponse(
+                    {"error": "forbidden", "detail": "Player role required"},
+                    status=403,
+                )
+            role_check_result = self._check_player_role(user_id)
+            if role_check_result is not None:
+                return role_check_result
 
             return JsonResponse(
                 {
