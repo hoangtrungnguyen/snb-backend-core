@@ -1,5 +1,5 @@
 """
-auth_ext.views — Authentication views for court owners.
+auth_ext.views — Authentication views for court owners and players.
 
 POST /auth/owner/login
     Accepts {"email": "...", "password": "..."}
@@ -14,6 +14,13 @@ POST /auth/owner/forgot-password
     Always returns HTTP 200 {"message": "If that email exists, a reset link has been sent"}
     Anti-enumeration: response is identical whether email exists or not.
     Uses SUPABASE_ANON_KEY (not service role key).
+
+POST /auth/player/signup
+    Accepts {"email": "...", "password": "..."}
+    Validates password: min 8 chars, >=1 letter, >=1 digit
+    Proxies to Supabase Auth signUp (POST /auth/v1/signup)
+    Returns 201 {"message": "Confirmation email sent", "user": {"id": "...", "email": "..."}}
+    Returns 409 {"error": "email_already_registered"} if Supabase returns 422
 """
 import json
 import logging
@@ -249,3 +256,106 @@ class TokenRefreshView(View):
             return JsonResponse({"error": "invalid_token"}, status=401)
 
         return JsonResponse({"error": "Authentication service unavailable."}, status=502)
+
+
+# ---------------------------------------------------------------------------
+# Player auth
+# ---------------------------------------------------------------------------
+
+def _validate_password(password: str) -> dict | None:
+    """
+    Validate password rules:
+    - min 8 characters
+    - at least 1 letter
+    - at least 1 digit
+
+    Returns None if valid, or a dict describing the failures.
+    """
+    errors = {}
+    if len(password) < 8:
+        errors["length"] = "Password must be at least 8 characters."
+    if not any(c.isalpha() for c in password):
+        errors["letter"] = "Password must contain at least one letter."
+    if not any(c.isdigit() for c in password):
+        errors["digit"] = "Password must contain at least one digit."
+    return errors if errors else None
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PlayerSignupView(View):
+    """Handle POST /auth/player/signup by delegating to Supabase Auth signUp."""
+
+    def post(self, request):
+        # Parse JSON body
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        email = body.get("email")
+        password = body.get("password")
+
+        if not email:
+            return JsonResponse({"error": "email is required."}, status=400)
+        if not password:
+            return JsonResponse({"error": "password is required."}, status=400)
+
+        # Password validation before calling Supabase
+        validation_errors = _validate_password(password)
+        if validation_errors:
+            return JsonResponse(
+                {"error": "validation_error", "detail": validation_errors},
+                status=400,
+            )
+
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+
+        signup_endpoint = f"{supabase_url}/auth/v1/signup"
+
+        try:
+            supabase_resp = requests.post(
+                signup_endpoint,
+                json={"email": email, "password": password},
+                headers={
+                    "apikey": supabase_anon_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            return JsonResponse(
+                {"error": "Authentication service unavailable.", "detail": str(exc)},
+                status=502,
+            )
+
+        if supabase_resp.status_code == 200:
+            data = supabase_resp.json()
+            return JsonResponse(
+                {
+                    "message": "Confirmation email sent",
+                    "user": {
+                        "id": data.get("id"),
+                        "email": data.get("email"),
+                    },
+                },
+                status=201,
+            )
+
+        # Supabase 422 means the email is already registered
+        if supabase_resp.status_code == 422:
+            return JsonResponse(
+                {"error": "email_already_registered"},
+                status=409,
+            )
+
+        # Other Supabase errors
+        try:
+            error_data = supabase_resp.json()
+        except ValueError:
+            error_data = {"error": "Unknown error from authentication service."}
+
+        return JsonResponse(
+            {"error": error_data.get("msg") or error_data.get("error") or "Signup failed."},
+            status=502,
+        )
