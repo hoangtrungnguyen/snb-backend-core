@@ -535,3 +535,50 @@ class PlayerLoginView(View):
             {"error": "Authentication service unavailable."},
             status=503,
         )
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PlayerForgotPasswordView(View):
+    """Handle POST /auth/player/forgot-password by delegating to Supabase Auth.
+
+    Calls POST /auth/v1/recover with the player's email and a redirect_to URL
+    so the reset link in the Supabase email points back to the app's
+    /auth/callback?type=recovery page.
+
+    Always returns HTTP 200 regardless of whether the email exists or whether
+    Supabase itself returns an error — prevents user enumeration attacks.
+    """
+
+    def post(self, request):
+        # Parse JSON body
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        email = body.get("email")
+        if not email:
+            return JsonResponse({"error": "email is required."}, status=400)
+
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        app_base_url = getattr(settings, "APP_BASE_URL", "")
+
+        recover_endpoint = f"{supabase_url}/auth/v1/recover"
+        redirect_to = f"{app_base_url}/auth/callback?type=recovery"
+
+        try:
+            requests.post(
+                recover_endpoint,
+                json={"email": email, "redirect_to": redirect_to},
+                headers={
+                    "apikey": supabase_anon_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException:
+            # Intentionally swallow — anti-enumeration requires always-200
+            pass
+
+        return JsonResponse({"message": _RESET_LINK_SENT_MSG}, status=200)
