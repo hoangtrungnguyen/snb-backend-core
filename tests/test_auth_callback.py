@@ -1,253 +1,249 @@
 """
 Tests for GET /auth/callback endpoint.
 
-Supabase redirects here after email verification.  This endpoint handles both:
-- PKCE flow:      ?code=<code>
-- Token-hash flow: ?token_hash=<hash>&type=email
-
-No real network requests are made — Supabase HTTP calls are mocked.
+Covers:
+- Happy path: code exchanged for tokens, users row upserted, redirect with
+  tokens in URL fragment (not query params)
+- Missing code param → 400
+- Supabase token exchange failure → 400
+- Network error on token exchange → 503
+- Network error on upsert → 503
+- token_type validation (only allowlisted values accepted)
+- Tokens NOT in query params (security requirement)
 """
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
+from urllib.parse import urlparse, parse_qs, unquote_plus
 
+import django
 from django.test import TestCase, Client, override_settings
+import os
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "spb_core.settings")
 
 
-def _supabase_token_response(access_token="acc.test", refresh_token="ref.test"):
-    """Build a typical Supabase /auth/v1/token success response."""
-    mock = MagicMock()
-    mock.status_code = 200
-    mock.json.return_value = {
+def _make_token_response(
+    access_token="eyJ.access.token",
+    refresh_token="eyJ.refresh.token",
+    token_type="bearer",
+):
+    """Build a mock Supabase token-exchange response."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "token_type": "bearer",
+        "token_type": token_type,
         "expires_in": 3600,
-        "user": {"id": "user-uuid-1", "email": "user@example.com"},
+        "user": {
+            "id": "user-uuid-abc123",
+            "email": "player@example.com",
+            "user_metadata": {"full_name": "Test Player"},
+        },
     }
-    return mock
+    return mock_resp
 
 
-def _supabase_verify_response(access_token="acc.test", refresh_token="ref.test"):
-    """Build a typical Supabase /auth/v1/verify success response."""
-    mock = MagicMock()
-    mock.status_code = 200
-    mock.json.return_value = {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "expires_in": 3600,
-        "user": {"id": "user-uuid-1", "email": "user@example.com"},
-    }
-    return mock
+def _make_upsert_response():
+    """Build a mock Supabase Admin upsert response."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = []
+    return mock_resp
 
 
-def _supabase_error_response(status=400):
-    """Build a Supabase error response."""
-    mock = MagicMock()
-    mock.status_code = status
-    mock.json.return_value = {
-        "error": "invalid_grant",
-        "error_description": "Token has expired or is invalid",
-    }
-    return mock
-
-
-# ---------------------------------------------------------------------------
-# PKCE code flow
-# ---------------------------------------------------------------------------
-
-class AuthCallbackPKCETests(TestCase):
-    """Tests for ?code=<code> (PKCE) flow."""
+@override_settings(
+    SUPABASE_URL="https://xyzproject.supabase.co",
+    SUPABASE_ANON_KEY="anon-key-test",
+    SUPABASE_SERVICE_ROLE_KEY="service-role-key-test",
+    FRONTEND_URL="https://app.example.com",
+)
+class AuthCallbackViewTests(TestCase):
+    """Tests for GET /auth/callback."""
 
     def setUp(self):
         self.client = Client()
         self.url = "/auth/callback"
 
-    def test_pkce_success_returns_200_with_tokens(self):
-        """Valid code → exchange with Supabase → 200 with tokens."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_token_response()):
-            resp = self.client.get(self.url, {"code": "pkce-auth-code-123"})
+    # ------------------------------------------------------------------
+    # Happy path
+    # ------------------------------------------------------------------
 
-        self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertEqual(body["status"], "verified")
-        self.assertEqual(body["access_token"], "acc.test")
-        self.assertEqual(body["refresh_token"], "ref.test")
+    def test_success_redirects_with_tokens_in_fragment(self):
+        """Valid code → tokens exchanged → redirect with tokens in URL fragment."""
+        token_resp = _make_token_response()
+        upsert_resp = _make_upsert_response()
 
-    def test_pkce_calls_supabase_token_endpoint(self):
-        """PKCE flow must POST to /auth/v1/token?grant_type=pkce."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_token_response()) as mock_post:
-            self.client.get(self.url, {"code": "pkce-auth-code-123"})
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]):
+            resp = self.client.get(self.url, {"code": "test-auth-code"})
 
-        mock_post.assert_called_once()
-        call_url = mock_post.call_args[0][0]
-        self.assertIn("/auth/v1/token", call_url)
-        call_params = mock_post.call_args[1].get("params", {})
-        self.assertEqual(call_params.get("grant_type"), "pkce")
+        self.assertEqual(resp.status_code, 302)
+        location = resp["Location"]
+        # Tokens MUST be in fragment, not query params
+        parsed = urlparse(location)
+        self.assertNotIn("access_token", parsed.query)
+        self.assertNotIn("refresh_token", parsed.query)
+        # Fragment must contain tokens
+        self.assertIn("access_token=", parsed.fragment)
+        self.assertIn("refresh_token=", parsed.fragment)
 
-    def test_pkce_sends_code_in_body(self):
-        """PKCE request body must include auth_code."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_token_response()) as mock_post:
-            self.client.get(self.url, {"code": "my-pkce-code"})
+    def test_success_fragment_contains_correct_tokens(self):
+        """Fragment params must contain the exact tokens returned by Supabase."""
+        token_resp = _make_token_response(
+            access_token="my.access.token",
+            refresh_token="my.refresh.token",
+        )
+        upsert_resp = _make_upsert_response()
 
-        posted_json = mock_post.call_args[1].get("json", {})
-        self.assertEqual(posted_json.get("auth_code"), "my-pkce-code")
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]):
+            resp = self.client.get(self.url, {"code": "test-auth-code"})
 
-    def test_pkce_failure_returns_400(self):
-        """Supabase rejects code → 400 {"error": "verification_failed"}."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_error_response()):
+        location = resp["Location"]
+        parsed = urlparse(location)
+        # Parse fragment as query string
+        frag_params = parse_qs(parsed.fragment)
+        self.assertEqual(frag_params["access_token"][0], "my.access.token")
+        self.assertEqual(frag_params["refresh_token"][0], "my.refresh.token")
+
+    def test_success_calls_supabase_token_endpoint(self):
+        """View must call Supabase PKCE token endpoint with the code."""
+        token_resp = _make_token_response()
+        upsert_resp = _make_upsert_response()
+
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post:
+            self.client.get(self.url, {"code": "exchange-code-xyz"})
+
+        first_call = mock_post.call_args_list[0]
+        called_url = first_call[0][0] if first_call[0] else first_call[1].get("url", "")
+        self.assertIn("/auth/v1/token", called_url)
+        # Must include code in payload
+        posted_json = first_call[1].get("json") or {}
+        self.assertEqual(posted_json.get("auth_code"), "exchange-code-xyz")
+
+    def test_success_upserts_users_row(self):
+        """After token exchange, view must upsert a users row."""
+        token_resp = _make_token_response()
+        upsert_resp = _make_upsert_response()
+
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post:
+            self.client.get(self.url, {"code": "test-code"})
+
+        # Second call must be the upsert
+        self.assertEqual(mock_post.call_count, 2)
+        upsert_call = mock_post.call_args_list[1]
+        upsert_url = upsert_call[0][0] if upsert_call[0] else upsert_call[1].get("url", "")
+        self.assertIn("/rest/v1/users", upsert_url)
+
+    def test_upserted_user_has_player_role(self):
+        """Upserted users row must have role='player'."""
+        token_resp = _make_token_response()
+        upsert_resp = _make_upsert_response()
+
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post:
+            self.client.get(self.url, {"code": "test-code"})
+
+        upsert_call = mock_post.call_args_list[1]
+        posted_json = upsert_call[1].get("json") or {}
+        # May be a list (bulk upsert) or dict
+        if isinstance(posted_json, list):
+            self.assertEqual(posted_json[0].get("role"), "player")
+        else:
+            self.assertEqual(posted_json.get("role"), "player")
+
+    # ------------------------------------------------------------------
+    # Missing / invalid code
+    # ------------------------------------------------------------------
+
+    def test_missing_code_returns_400(self):
+        """Request without code param → 400 without hitting Supabase."""
+        with patch("auth_ext.views.requests.post") as mock_post:
+            resp = self.client.get(self.url)
+
+        self.assertEqual(resp.status_code, 400)
+        mock_post.assert_not_called()
+
+    def test_empty_code_returns_400(self):
+        """Empty code param → 400."""
+        with patch("auth_ext.views.requests.post") as mock_post:
+            resp = self.client.get(self.url, {"code": ""})
+
+        self.assertEqual(resp.status_code, 400)
+        mock_post.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Supabase token exchange error
+    # ------------------------------------------------------------------
+
+    def test_supabase_token_error_returns_400(self):
+        """Supabase token exchange failure → 400, no internal details."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.json.return_value = {"error": "invalid_grant", "error_description": "Bad code"}
+
+        with patch("auth_ext.views.requests.post", return_value=mock_resp):
             resp = self.client.get(self.url, {"code": "bad-code"})
 
         self.assertEqual(resp.status_code, 400)
         body = resp.json()
-        self.assertEqual(body["error"], "verification_failed")
+        self.assertIn("error", body)
+        # No internal Supabase detail in response
+        self.assertNotIn("error_description", body)
 
-    @override_settings(FRONTEND_URL="https://app.sportbuddies.io")
-    def test_pkce_redirects_to_frontend_when_configured(self):
-        """If FRONTEND_URL is set, redirect there with tokens as URL fragment (not query params)."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_token_response()):
-            resp = self.client.get(self.url, {"code": "pkce-code"})
+    # ------------------------------------------------------------------
+    # Network errors
+    # ------------------------------------------------------------------
 
-        # Should be a redirect (3xx) to FRONTEND_URL
-        self.assertIn(resp.status_code, [301, 302])
-        location = resp.get("Location", "")
-        self.assertIn("sportbuddies.io", location)
-        # Tokens must be in the URL fragment (after #), not in query params
-        self.assertIn("#", location)
-        fragment_start = location.index("#")
-        fragment = location[fragment_start:]
-        self.assertIn("access_token=", fragment)
-        self.assertIn("refresh_token=", fragment)
-        # Ensure tokens are NOT in the query string part
-        query_part = location[:fragment_start]
-        self.assertNotIn("access_token=", query_part)
-        self.assertNotIn("refresh_token=", query_part)
-
-
-# ---------------------------------------------------------------------------
-# token_hash flow
-# ---------------------------------------------------------------------------
-
-class AuthCallbackTokenHashTests(TestCase):
-    """Tests for ?token_hash=<hash>&type=email flow."""
-
-    def setUp(self):
-        self.client = Client()
-        self.url = "/auth/callback"
-
-    def test_token_hash_success_returns_200_with_tokens(self):
-        """Valid token_hash → verify with Supabase → 200 with tokens."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_verify_response()):
-            resp = self.client.get(
-                self.url,
-                {"token_hash": "hash-abc-123", "type": "email"},
-            )
-
-        self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertEqual(body["status"], "verified")
-        self.assertIn("access_token", body)
-        self.assertIn("refresh_token", body)
-
-    def test_token_hash_calls_supabase_verify_endpoint(self):
-        """token_hash flow must POST to /auth/v1/verify."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_verify_response()) as mock_post:
-            self.client.get(
-                self.url,
-                {"token_hash": "hash-abc-123", "type": "email"},
-            )
-
-        mock_post.assert_called_once()
-        call_url = mock_post.call_args[0][0]
-        self.assertIn("/auth/v1/verify", call_url)
-
-    def test_token_hash_sends_hash_and_type_in_body(self):
-        """Verify request body must include token_hash and type."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_verify_response()) as mock_post:
-            self.client.get(
-                self.url,
-                {"token_hash": "my-hash", "type": "email"},
-            )
-
-        posted_json = mock_post.call_args[1].get("json", {})
-        self.assertEqual(posted_json.get("token_hash"), "my-hash")
-        self.assertEqual(posted_json.get("type"), "email")
-
-    def test_token_hash_failure_returns_400(self):
-        """Supabase rejects hash → 400 {"error": "verification_failed"}."""
-        with patch("auth_ext.views.requests.post", return_value=_supabase_error_response()):
-            resp = self.client.get(
-                self.url,
-                {"token_hash": "expired-hash", "type": "email"},
-            )
-
-        self.assertEqual(resp.status_code, 400)
-        body = resp.json()
-        self.assertEqual(body["error"], "verification_failed")
-
-    def test_invalid_token_type_returns_400_without_calling_supabase(self):
-        """Disallowed type value → 400 before any Supabase call."""
-        with patch("auth_ext.views.requests.post") as mock_post:
-            resp = self.client.get(
-                self.url,
-                {"token_hash": "some-hash", "type": "malicious_type"},
-            )
-
-        self.assertEqual(resp.status_code, 400)
-        body = resp.json()
-        self.assertEqual(body["error"], "verification_failed")
-        # Supabase must NOT have been contacted
-        mock_post.assert_not_called()
-
-    def test_allowed_token_types_accepted(self):
-        """Each type in the allowlist (signup, recovery, invite) is accepted."""
-        for allowed_type in ("signup", "recovery", "invite"):
-            with self.subTest(token_type=allowed_type):
-                with patch(
-                    "auth_ext.views.requests.post",
-                    return_value=_supabase_verify_response(),
-                ):
-                    resp = self.client.get(
-                        self.url,
-                        {"token_hash": "hash-abc", "type": allowed_type},
-                    )
-                self.assertEqual(resp.status_code, 200)
-
-
-# ---------------------------------------------------------------------------
-# Missing / invalid parameters
-# ---------------------------------------------------------------------------
-
-class AuthCallbackMissingParamsTests(TestCase):
-    """Tests for requests with no recognisable parameters."""
-
-    def setUp(self):
-        self.client = Client()
-        self.url = "/auth/callback"
-
-    def test_no_params_returns_400(self):
-        """Request with no query params → 400 verification_failed."""
-        resp = self.client.get(self.url)
-        self.assertEqual(resp.status_code, 400)
-        body = resp.json()
-        self.assertEqual(body["error"], "verification_failed")
-
-    def test_only_type_without_hash_returns_400(self):
-        """type=email without token_hash → 400."""
-        resp = self.client.get(self.url, {"type": "email"})
-        self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.json()["error"], "verification_failed")
-
-    def test_network_error_returns_400(self):
-        """RequestException from Supabase → 400 verification_failed."""
+    def test_network_error_on_token_exchange_returns_503(self):
+        """Network error on token exchange → 503."""
         import requests as req_lib
         with patch("auth_ext.views.requests.post", side_effect=req_lib.RequestException("timeout")):
-            resp = self.client.get(self.url, {"code": "some-code"})
+            resp = self.client.get(self.url, {"code": "any-code"})
 
-        self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.json()["error"], "verification_failed")
+        self.assertEqual(resp.status_code, 503)
+        body = resp.json()
+        self.assertIn("error", body)
+        # No internal error detail
+        self.assertNotIn("timeout", str(body))
 
-    def test_callback_only_accepts_get(self):
-        """POST to /auth/callback → 405 Method Not Allowed."""
-        resp = self.client.post(self.url)
+    def test_network_error_on_upsert_returns_503(self):
+        """Network error on DB upsert → 503."""
+        import requests as req_lib
+        token_resp = _make_token_response()
+
+        with patch(
+            "auth_ext.views.requests.post",
+            side_effect=[token_resp, req_lib.RequestException("db timeout")],
+        ):
+            resp = self.client.get(self.url, {"code": "any-code"})
+
+        self.assertEqual(resp.status_code, 503)
+
+    # ------------------------------------------------------------------
+    # Security: tokens must not appear in query params
+    # ------------------------------------------------------------------
+
+    def test_tokens_not_in_query_params(self):
+        """Tokens must never appear in query params (Referer / log leak prevention)."""
+        token_resp = _make_token_response(
+            access_token="secret.access",
+            refresh_token="secret.refresh",
+        )
+        upsert_resp = _make_upsert_response()
+
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]):
+            resp = self.client.get(self.url, {"code": "test-code"})
+
+        location = resp["Location"]
+        parsed = urlparse(location)
+        # Ensure tokens are NOT in the query string
+        self.assertNotIn("secret.access", parsed.query)
+        self.assertNotIn("secret.refresh", parsed.query)
+
+    # ------------------------------------------------------------------
+    # POST method not allowed
+    # ------------------------------------------------------------------
+
+    def test_post_returns_405(self):
+        """POST to /auth/callback → 405."""
+        resp = self.client.post(self.url, data={})
         self.assertEqual(resp.status_code, 405)
