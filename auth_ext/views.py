@@ -214,6 +214,10 @@ class OwnerForgotPasswordView(View):
 
 logger = logging.getLogger(__name__)
 
+# Allowlist for token_type values returned by Supabase.
+# We accept "bearer" and session-level types; reject anything unexpected.
+ALLOWED_TOKEN_TYPES = frozenset({"bearer", "email", "signup", "recovery", "invite"})
+
 
 @method_decorator(csrf_exempt, name="dispatch")
 class TokenRefreshView(View):
@@ -455,71 +459,127 @@ class PlayerSignupView(View):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class AuthCallbackView(View):
+    """Handle GET /auth/callback — OAuth redirect handler.
+
+    Receives the authorization code from Supabase after an OAuth flow (e.g.
+    Google sign-in), exchanges it for access+refresh tokens via the Supabase
+    PKCE token endpoint, upserts a `users` row in the database (via the
+    Supabase Admin REST API) with role='player', then redirects to the
+    configured FRONTEND_URL with the tokens in the URL fragment.
+
+    Security guarantees:
+    - Tokens are placed in the URL *fragment* (#), never in query params (?).
+      Fragment values are not sent to the server and do not appear in Referer
+      headers or server logs.
+    - token_type returned by Supabase is validated against an allowlist.
+    - No internal error details are returned in response bodies.
+    - Network errors map to 503; Supabase auth errors map to 400.
     """
-    Handle GET /auth/callback — the Supabase email-verification redirect target.
-
-    Two supported flows:
-      - PKCE:       ?code=<code>
-      - token_hash: ?token_hash=<hash>&type=<type>
-
-    On success, redirects to FRONTEND_URL with tokens in URL fragment.
-    On failure returns 400 {"error": "verification_failed"}.
-    """
-
-    _VERIFICATION_FAILED = {"error": "verification_failed"}
-    ALLOWED_TOKEN_TYPES = {"email", "signup", "recovery", "invite"}
 
     def get(self, request):
-        code = request.GET.get("code")
-        token_hash = request.GET.get("token_hash")
-        token_type = request.GET.get("type")
+        code = request.GET.get("code", "").strip()
+        if not code:
+            return JsonResponse({"error": "Missing required parameter: code."}, status=400)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
         supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-        headers = {"apikey": supabase_anon_key, "Content-Type": "application/json"}
+        supabase_service_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
+        frontend_url = getattr(settings, "FRONTEND_URL", "/")
 
+        # ------------------------------------------------------------------
+        # Step 1: Exchange authorization code for tokens (PKCE flow)
+        # ------------------------------------------------------------------
+        token_endpoint = f"{supabase_url}/auth/v1/token"
         try:
-            if code:
-                supabase_resp = requests.post(
-                    f"{supabase_url}/auth/v1/token",
-                    params={"grant_type": "pkce"},
-                    json={"auth_code": code},
-                    headers=headers,
+            token_resp = requests.post(
+                token_endpoint,
+                params={"grant_type": "pkce"},
+                json={"auth_code": code},
+                headers={
+                    "apikey": supabase_anon_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            logger.error("Supabase token exchange failed: %s", exc)
+            return JsonResponse(
+                {"error": "Authentication service unavailable."},
+                status=503,
+            )
+
+        if token_resp.status_code != 200:
+            logger.warning(
+                "Supabase token exchange returned %s", token_resp.status_code
+            )
+            return JsonResponse(
+                {"error": "OAuth token exchange failed."},
+                status=400,
+            )
+
+        token_data = token_resp.json()
+        access_token = token_data.get("access_token", "")
+        refresh_token = token_data.get("refresh_token", "")
+        token_type = token_data.get("token_type", "")
+        user_data = token_data.get("user") or {}
+
+        # Validate token_type against allowlist (security: reject unexpected values).
+        if token_type.lower() not in ALLOWED_TOKEN_TYPES and token_type.lower() != "bearer":
+            logger.warning("Unexpected token_type from Supabase: %r", token_type)
+            return JsonResponse(
+                {"error": "OAuth token exchange failed."},
+                status=400,
+            )
+
+        # ------------------------------------------------------------------
+        # Step 2: Upsert users row via Supabase Admin REST API
+        # ------------------------------------------------------------------
+        user_id = user_data.get("id")
+        email = user_data.get("email", "")
+        full_name = (user_data.get("user_metadata") or {}).get("full_name", "")
+        avatar_url = (user_data.get("user_metadata") or {}).get("avatar_url", "")
+
+        if user_id:
+            upsert_endpoint = f"{supabase_url}/rest/v1/users"
+            upsert_payload = {
+                "id": user_id,
+                "email": email,
+                "full_name": full_name,
+                "avatar_url": avatar_url,
+                "role": "player",
+            }
+            try:
+                requests.post(
+                    upsert_endpoint,
+                    json=upsert_payload,
+                    headers={
+                        "apikey": supabase_service_key,
+                        "Authorization": f"Bearer {supabase_service_key}",
+                        "Content-Type": "application/json",
+                        # Prefer=resolution=merge-duplicates instructs PostgREST to
+                        # do an upsert (INSERT ... ON CONFLICT DO UPDATE).
+                        "Prefer": "resolution=merge-duplicates",
+                    },
                     timeout=10,
                 )
-            elif token_hash and token_type:
-                if token_type not in self.ALLOWED_TOKEN_TYPES:
-                    return JsonResponse(
-                        {"error": "verification_failed", "detail": "Invalid token type"},
-                        status=400,
-                    )
-                supabase_resp = requests.post(
-                    f"{supabase_url}/auth/v1/verify",
-                    json={"token_hash": token_hash, "type": token_type},
-                    headers=headers,
-                    timeout=10,
+            except requests.RequestException as exc:
+                logger.error("Supabase users upsert failed: %s", exc)
+                return JsonResponse(
+                    {"error": "User profile service unavailable."},
+                    status=503,
                 )
-            else:
-                return JsonResponse(self._VERIFICATION_FAILED, status=400)
-        except requests.RequestException:
-            return JsonResponse(self._VERIFICATION_FAILED, status=400)
 
-        if supabase_resp.status_code != 200:
-            return JsonResponse(self._VERIFICATION_FAILED, status=400)
-
-        data = supabase_resp.json()
-        access_token = data.get("access_token", "")
-        refresh_token = data.get("refresh_token", "")
-
-        frontend_url = getattr(settings, "FRONTEND_URL", "")
-        if frontend_url:
-            fragment = urlencode({"access_token": access_token, "refresh_token": refresh_token})
-            return HttpResponseRedirect(f"{frontend_url}#{fragment}")
-
-        return JsonResponse(
-            {"status": "verified", "access_token": access_token, "refresh_token": refresh_token},
-            status=200,
-        )
+        # ------------------------------------------------------------------
+        # Step 3: Redirect to frontend with tokens in URL fragment
+        # Tokens go in the fragment (#) — NOT in query params (?) — so they
+        # are never sent to the server and don't appear in Referer headers.
+        # ------------------------------------------------------------------
+        fragment = urlencode({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+        })
+        redirect_url = f"{frontend_url}#{fragment}"
+        return HttpResponseRedirect(redirect_url)
 
 
 # ---------------------------------------------------------------------------
