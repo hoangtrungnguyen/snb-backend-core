@@ -16,6 +16,7 @@ POST /auth/owner/forgot-password
     Uses SUPABASE_ANON_KEY (not service role key).
 """
 import json
+import logging
 
 import requests
 from django.conf import settings
@@ -185,3 +186,66 @@ class OwnerForgotPasswordView(View):
             pass
 
         return JsonResponse({"message": _RESET_LINK_SENT_MSG}, status=200)
+
+
+logger = logging.getLogger(__name__)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class TokenRefreshView(View):
+    """Handle POST /auth/refresh by exchanging a refresh token via Supabase Auth.
+
+    Accepts {"refresh_token": "..."} and calls Supabase
+    POST /auth/v1/token?grant_type=refresh_token.
+
+    Returns:
+        200 {"access_token": "...", "refresh_token": "...", "user": {...}} on success
+        400 on missing/malformed request body
+        401 {"error": "invalid_token"} on invalid or expired refresh token
+    """
+
+    def post(self, request):
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        refresh_token = body.get("refresh_token")
+        if not refresh_token:
+            return JsonResponse({"error": "refresh_token is required."}, status=400)
+
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+
+        token_endpoint = f"{supabase_url}/auth/v1/token"
+
+        try:
+            supabase_resp = requests.post(
+                token_endpoint,
+                params={"grant_type": "refresh_token"},
+                json={"refresh_token": refresh_token},
+                headers={
+                    "apikey": supabase_anon_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            logger.error("Token refresh network error: %s", exc)
+            return JsonResponse({"error": "service_unavailable"}, status=502)
+
+        if supabase_resp.status_code == 200:
+            data = supabase_resp.json()
+            return JsonResponse(
+                {
+                    "access_token": data.get("access_token"),
+                    "refresh_token": data.get("refresh_token"),
+                    "user": data.get("user"),
+                },
+                status=200,
+            )
+
+        if supabase_resp.status_code in (400, 401, 422):
+            return JsonResponse({"error": "invalid_token"}, status=401)
+
+        return JsonResponse({"error": "Authentication service unavailable."}, status=502)
