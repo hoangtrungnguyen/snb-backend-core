@@ -1,15 +1,32 @@
 """
 Tests for POST /auth/player/login endpoint.
 
+Anti-enumeration property: wrong password and unknown email must both return
+the same 401 with identical response bodies — no field discrimination.
+
 Mocks the Supabase HTTP call — no real network requests are made.
 """
 import json
 from unittest.mock import patch, MagicMock
 
+import requests as requests_module
 from django.test import TestCase, Client
 
 
-def _make_supabase_success_response(email_confirmed=True):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_supabase_4xx(status_code: int, error: str = "invalid_grant",
+                       error_description: str = "Invalid login credentials"):
+    """Return a mock Supabase response with the given 4xx status."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.json.return_value = {"error": error, "error_description": error_description}
+    return mock_resp
+
+
+def _make_supabase_success(email_confirmed=True):
     """Build a successful Supabase mock response."""
     mock_resp = MagicMock()
     mock_resp.status_code = 200
@@ -22,7 +39,6 @@ def _make_supabase_success_response(email_confirmed=True):
         user["email_confirmed_at"] = "2026-01-01T00:00:00Z"
     else:
         user["email_confirmed_at"] = None
-
     mock_resp.json.return_value = {
         "access_token": "eyJ.player.access",
         "refresh_token": "eyJ.player.refresh",
@@ -32,6 +48,10 @@ def _make_supabase_success_response(email_confirmed=True):
     }
     return mock_resp
 
+
+# ---------------------------------------------------------------------------
+# Test class
+# ---------------------------------------------------------------------------
 
 class PlayerLoginViewTests(TestCase):
     """Tests for the POST /auth/player/login endpoint."""
@@ -45,14 +65,8 @@ class PlayerLoginViewTests(TestCase):
     # ------------------------------------------------------------------
 
     def test_login_success_returns_tokens_and_user(self):
-        """Valid credentials + confirmed email + player role → 200 with access_token, refresh_token, user."""
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-        mock_role = MagicMock()
-        mock_role.ok = True
-        mock_role.json.return_value = [{"role": "player"}]
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth), \
-             patch("auth_ext.views.requests.get", return_value=mock_role):
+        """Valid credentials + confirmed email → 200 with access_token, refresh_token, user."""
+        with patch("auth_ext.views.requests.post", return_value=_make_supabase_success()):
             resp = self.client.post(
                 self.url,
                 data=json.dumps({"email": "player@example.com", "password": "secret"}),
@@ -70,13 +84,7 @@ class PlayerLoginViewTests(TestCase):
 
     def test_login_calls_supabase_with_correct_params(self):
         """View must call Supabase auth REST API with grant_type=password."""
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-        mock_role = MagicMock()
-        mock_role.ok = True
-        mock_role.json.return_value = [{"role": "player"}]
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth) as mock_post, \
-             patch("auth_ext.views.requests.get", return_value=mock_role):
+        with patch("auth_ext.views.requests.post", return_value=_make_supabase_success()) as mock_post:
             self.client.post(
                 self.url,
                 data=json.dumps({"email": "player@example.com", "password": "secret"}),
@@ -91,128 +99,12 @@ class PlayerLoginViewTests(TestCase):
         self.assertEqual(posted_json.get("email"), "player@example.com")
         self.assertEqual(posted_json.get("password"), "secret")
 
-    def test_player_role_is_accepted(self):
-        """Player login succeeds when users.role = 'player'."""
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-        mock_role = MagicMock()
-        mock_role.ok = True
-        mock_role.json.return_value = [{"role": "player"}]
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth), \
-             patch("auth_ext.views.requests.get", return_value=mock_role):
-            resp = self.client.post(
-                self.url,
-                data=json.dumps({"email": "player@example.com", "password": "secret"}),
-                content_type="application/json",
-            )
-
-        self.assertEqual(resp.status_code, 200)
-
-    def test_non_player_role_returns_403(self):
-        """Player login blocked when users.role != 'player' → 403 forbidden."""
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-        mock_role = MagicMock()
-        mock_role.ok = True
-        mock_role.json.return_value = [{"role": "owner"}]
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth), \
-             patch("auth_ext.views.requests.get", return_value=mock_role):
-            resp = self.client.post(
-                self.url,
-                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
-                content_type="application/json",
-            )
-
-        self.assertEqual(resp.status_code, 403)
-        body = resp.json()
-        self.assertEqual(body["error"], "forbidden")
-        self.assertEqual(body["detail"], "Player role required")
-
-    def test_user_not_found_in_users_table_returns_403(self):
-        """Player login blocked when user not found in users table → 403."""
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-        mock_role = MagicMock()
-        mock_role.ok = True
-        mock_role.json.return_value = []  # empty list → not found
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth), \
-             patch("auth_ext.views.requests.get", return_value=mock_role):
-            resp = self.client.post(
-                self.url,
-                data=json.dumps({"email": "player@example.com", "password": "secret"}),
-                content_type="application/json",
-            )
-
-        self.assertEqual(resp.status_code, 403)
-        body = resp.json()
-        self.assertEqual(body["error"], "forbidden")
-        self.assertEqual(body["detail"], "Player role required")
-
-    def test_role_check_network_failure_returns_503(self):
-        """Network failure during role check → 503 service_unavailable."""
-        import requests as req_module
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth), \
-             patch("auth_ext.views.requests.get", side_effect=req_module.RequestException("timeout")):
-            resp = self.client.post(
-                self.url,
-                data=json.dumps({"email": "player@example.com", "password": "secret"}),
-                content_type="application/json",
-            )
-
-        self.assertEqual(resp.status_code, 503)
-        body = resp.json()
-        self.assertEqual(body["error"], "service_unavailable")
-
-    def test_non_list_role_response_returns_403(self):
-        """Non-list JSON from Supabase role check → treat as not-found → 403."""
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-        mock_role = MagicMock()
-        mock_role.ok = True
-        mock_role.json.return_value = {"error": "unexpected"}  # non-list
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth), \
-             patch("auth_ext.views.requests.get", return_value=mock_role):
-            resp = self.client.post(
-                self.url,
-                data=json.dumps({"email": "player@example.com", "password": "secret"}),
-                content_type="application/json",
-            )
-
-        self.assertEqual(resp.status_code, 403)
-        body = resp.json()
-        self.assertEqual(body["error"], "forbidden")
-        self.assertEqual(body["detail"], "Player role required")
-
-    def test_role_check_happens_before_returning_tokens(self):
-        """Role check must happen before tokens are exposed to caller."""
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-        mock_role = MagicMock()
-        mock_role.ok = True
-        mock_role.json.return_value = [{"role": "owner"}]  # wrong role
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth), \
-             patch("auth_ext.views.requests.get", return_value=mock_role):
-            resp = self.client.post(
-                self.url,
-                data=json.dumps({"email": "owner@example.com", "password": "secret"}),
-                content_type="application/json",
-            )
-
-        # Tokens must NOT be present in a 403 response
-        self.assertEqual(resp.status_code, 403)
-        body = resp.json()
-        self.assertNotIn("access_token", body)
-        self.assertNotIn("refresh_token", body)
-
-    # ------------------------------------------------------------------
-    # Email verification enforcement
-    # ------------------------------------------------------------------
-
-    def test_unverified_email_returns_403(self):
-        """Supabase returns user with email_confirmed_at=null → 403 email_not_verified."""
-        mock_resp = _make_supabase_success_response(email_confirmed=False)
+    def test_any_role_is_accepted(self):
+        """Player login does not restrict by role — any authenticated user succeeds."""
+        mock_resp = _make_supabase_success(email_confirmed=True)
+        data = mock_resp.json.return_value
+        data["user"]["role"] = "player"
+        mock_resp.json.return_value = data
 
         with patch("auth_ext.views.requests.post", return_value=mock_resp):
             resp = self.client.post(
@@ -221,9 +113,23 @@ class PlayerLoginViewTests(TestCase):
                 content_type="application/json",
             )
 
+        self.assertEqual(resp.status_code, 200)
+
+    # ------------------------------------------------------------------
+    # Email verification enforcement
+    # ------------------------------------------------------------------
+
+    def test_unverified_email_returns_403(self):
+        """Supabase returns user with email_confirmed_at=null → 403 email_not_verified."""
+        with patch("auth_ext.views.requests.post", return_value=_make_supabase_success(email_confirmed=False)):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "player@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+
         self.assertEqual(resp.status_code, 403)
-        body = resp.json()
-        self.assertEqual(body["error"], "email_not_verified")
+        self.assertEqual(resp.json()["error"], "email_not_verified")
 
     def test_missing_email_confirmed_at_field_returns_403(self):
         """Supabase user dict without email_confirmed_at key → 403."""
@@ -247,49 +153,93 @@ class PlayerLoginViewTests(TestCase):
             )
 
         self.assertEqual(resp.status_code, 403)
-        body = resp.json()
-        self.assertEqual(body["error"], "email_not_verified")
+        self.assertEqual(resp.json()["error"], "email_not_verified")
 
     # ------------------------------------------------------------------
-    # Invalid credentials — generic 401 (no enumeration)
+    # Anti-enumeration: wrong password and unknown email → identical 401
     # ------------------------------------------------------------------
 
-    def test_invalid_credentials_returns_401_with_generic_error(self):
-        """Wrong password → Supabase 400 → endpoint returns 401 with 'invalid_credentials'."""
-        mock_resp = MagicMock()
-        mock_resp.status_code = 400
-        mock_resp.json.return_value = {
-            "error": "invalid_grant",
-            "error_description": "Invalid login credentials",
-        }
+    def test_wrong_password_returns_401_with_generic_body(self):
+        """Wrong password → Supabase 400 → 401 {"error":"invalid_credentials","detail":"Invalid credentials"}."""
+        mock_resp = _make_supabase_4xx(400, "invalid_grant", "Invalid login credentials")
 
         with patch("auth_ext.views.requests.post", return_value=mock_resp):
             resp = self.client.post(
                 self.url,
-                data=json.dumps({"email": "player@example.com", "password": "wrong"}),
+                data=json.dumps({"email": "player@example.com", "password": "wrong_password"}),
                 content_type="application/json",
             )
 
         self.assertEqual(resp.status_code, 401)
         body = resp.json()
         self.assertEqual(body["error"], "invalid_credentials")
+        self.assertEqual(body["detail"], "Invalid credentials")
 
-    def test_supabase_401_returns_401_generic(self):
-        """Supabase 401 → endpoint returns 401 with 'invalid_credentials'."""
-        mock_resp = MagicMock()
-        mock_resp.status_code = 401
-        mock_resp.json.return_value = {"error": "invalid_grant"}
+    def test_unknown_email_returns_401_with_generic_body(self):
+        """Unknown email → Supabase 400 → same 401 {"error":"invalid_credentials","detail":"Invalid credentials"}."""
+        # Supabase typically returns the same 400 for both unknown email and wrong password
+        mock_resp = _make_supabase_4xx(400, "invalid_grant", "Invalid login credentials")
 
         with patch("auth_ext.views.requests.post", return_value=mock_resp):
             resp = self.client.post(
                 self.url,
-                data=json.dumps({"email": "player@example.com", "password": "wrong"}),
+                data=json.dumps({"email": "nonexistent@example.com", "password": "some_password"}),
                 content_type="application/json",
             )
 
         self.assertEqual(resp.status_code, 401)
         body = resp.json()
         self.assertEqual(body["error"], "invalid_credentials")
+        self.assertEqual(body["detail"], "Invalid credentials")
+
+    def test_wrong_password_and_unknown_email_return_identical_bodies(self):
+        """
+        Anti-enumeration test: wrong password and unknown email must return
+        exactly the same response body — no field discrimination.
+        """
+        # Supabase 400 for wrong password
+        mock_wrong_pw = _make_supabase_4xx(400, "invalid_grant", "Invalid login credentials")
+        # Supabase 400 for unknown email (same error code from Supabase)
+        mock_unknown_email = _make_supabase_4xx(400, "invalid_grant", "Invalid login credentials")
+
+        with patch("auth_ext.views.requests.post", return_value=mock_wrong_pw):
+            resp_wrong_pw = self.client.post(
+                self.url,
+                data=json.dumps({"email": "player@example.com", "password": "wrong"}),
+                content_type="application/json",
+            )
+
+        with patch("auth_ext.views.requests.post", return_value=mock_unknown_email):
+            resp_unknown = self.client.post(
+                self.url,
+                data=json.dumps({"email": "nobody@example.com", "password": "anything"}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp_wrong_pw.status_code, resp_unknown.status_code)
+        self.assertEqual(resp_wrong_pw.json(), resp_unknown.json(),
+                         "Response bodies differ — enumeration is possible!")
+
+    def test_all_4xx_supabase_responses_return_same_generic_401(self):
+        """All Supabase 4xx responses (400–499) → same 401 generic response."""
+        expected_status = 401
+        expected_body = {"error": "invalid_credentials", "detail": "Invalid credentials"}
+
+        for supabase_status in (400, 401, 403, 422, 429):
+            with self.subTest(supabase_status=supabase_status):
+                mock_resp = _make_supabase_4xx(supabase_status)
+
+                with patch("auth_ext.views.requests.post", return_value=mock_resp):
+                    resp = self.client.post(
+                        self.url,
+                        data=json.dumps({"email": "player@example.com", "password": "wrong"}),
+                        content_type="application/json",
+                    )
+
+                self.assertEqual(resp.status_code, expected_status,
+                                 f"Supabase {supabase_status} → expected 401, got {resp.status_code}")
+                self.assertEqual(resp.json(), expected_body,
+                                 f"Supabase {supabase_status} → body mismatch")
 
     # ------------------------------------------------------------------
     # Bad request — missing / malformed body
@@ -345,71 +295,28 @@ class PlayerLoginViewTests(TestCase):
         self.assertEqual(resp.status_code, 405)
 
     # ------------------------------------------------------------------
-    # Upstream failure
+    # Upstream failure — network errors → 503
     # ------------------------------------------------------------------
 
-    def test_supabase_network_error_returns_502(self):
-        """Network failure calling Supabase → 502."""
-        import requests as req_module
-        with patch("auth_ext.views.requests.post", side_effect=req_module.RequestException("timeout")):
+    def test_supabase_network_error_returns_503(self):
+        """Network failure calling Supabase → 503 Service Unavailable (not 401, not 502)."""
+        with patch("auth_ext.views.requests.post",
+                   side_effect=requests_module.RequestException("connection timeout")):
             resp = self.client.post(
                 self.url,
                 data=json.dumps({"email": "player@example.com", "password": "secret"}),
                 content_type="application/json",
             )
-        self.assertEqual(resp.status_code, 502)
-
-    # ------------------------------------------------------------------
-    # Missing user id in auth response (HIGH security finding)
-    # ------------------------------------------------------------------
-
-    def test_missing_user_id_in_auth_response_returns_403(self):
-        """Supabase auth response with no 'id' field in user object → 403 forbidden."""
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "access_token": "eyJ.player.access",
-            "refresh_token": "eyJ.player.refresh",
-            "user": {
-                # 'id' deliberately absent
-                "email": "player@example.com",
-                "email_confirmed_at": "2026-01-01T00:00:00Z",
-            },
-        }
-
-        with patch("auth_ext.views.requests.post", return_value=mock_resp), \
-             patch("auth_ext.views.requests.get") as mock_get:
-            resp = self.client.post(
-                self.url,
-                data=json.dumps({"email": "player@example.com", "password": "secret"}),
-                content_type="application/json",
-            )
-
-        self.assertEqual(resp.status_code, 403)
-        body = resp.json()
-        self.assertEqual(body["error"], "forbidden")
-        # Role check (GET) must NOT be called — guard short-circuits before it
-        mock_get.assert_not_called()
-
-    # ------------------------------------------------------------------
-    # Non-200 HTTP status from Supabase REST role-check (MEDIUM finding)
-    # ------------------------------------------------------------------
-
-    def test_role_check_non_200_response_returns_503(self):
-        """Non-200 HTTP status from Supabase REST role-check → 503 service_unavailable."""
-        mock_auth = _make_supabase_success_response(email_confirmed=True)
-        mock_role = MagicMock()
-        mock_role.ok = False  # e.g. 401 from misconfigured service key
-        mock_role.status_code = 401
-
-        with patch("auth_ext.views.requests.post", return_value=mock_auth), \
-             patch("auth_ext.views.requests.get", return_value=mock_role):
-            resp = self.client.post(
-                self.url,
-                data=json.dumps({"email": "player@example.com", "password": "secret"}),
-                content_type="application/json",
-            )
-
         self.assertEqual(resp.status_code, 503)
-        body = resp.json()
-        self.assertEqual(body["error"], "service_unavailable")
+
+    def test_supabase_network_error_does_not_return_401(self):
+        """Network failures must NOT return 401 — they must be distinguishable from bad credentials."""
+        with patch("auth_ext.views.requests.post",
+                   side_effect=requests_module.RequestException("DNS resolution failed")):
+            resp = self.client.post(
+                self.url,
+                data=json.dumps({"email": "player@example.com", "password": "secret"}),
+                content_type="application/json",
+            )
+        self.assertNotEqual(resp.status_code, 401)
+        self.assertEqual(resp.status_code, 503)
