@@ -120,10 +120,23 @@ class OwnerLoginView(View):
 
         if supabase_resp.status_code == 200:
             data = supabase_resp.json()
+            user = data.get("user") or {}
+
+            # Enforce email verification: reject logins where email_confirmed_at
+            # is null or absent.  Supabase sets this field to a timestamp string
+            # once the user clicks the confirmation link; before that it is None.
+            if not user.get("email_confirmed_at"):
+                return JsonResponse(
+                    {
+                        "error": "email_not_verified",
+                        "detail": "Please verify your email before logging in.",
+                    },
+                    status=403,
+                )
 
             # Validate that the authenticated user has role='owner' in the users table.
             # This check must happen BEFORE returning tokens to the caller.
-            user_id = (data.get("user") or {}).get("id", "")
+            user_id = user.get("id", "")
             role_check_result = self._check_owner_role(user_id)
             if role_check_result is not None:
                 return role_check_result
@@ -132,7 +145,7 @@ class OwnerLoginView(View):
                 {
                     "access_token": data.get("access_token"),
                     "refresh_token": data.get("refresh_token"),
-                    "user": data.get("user"),
+                    "user": user,
                 },
                 status=200,
             )
