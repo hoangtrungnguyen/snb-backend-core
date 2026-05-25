@@ -31,6 +31,7 @@ import requests
 from django.core.cache import cache
 from django.conf import settings
 from django.http import JsonResponse, HttpResponseRedirect
+import urllib.parse
 from urllib.parse import urlencode
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
@@ -459,21 +460,16 @@ class PlayerSignupView(View):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class AuthCallbackView(View):
-    """Handle GET /auth/callback — OAuth redirect handler.
+    """Handle GET /auth/callback — OAuth redirect handler with identity merge.
 
     Receives the authorization code from Supabase after an OAuth flow (e.g.
     Google sign-in), exchanges it for access+refresh tokens via the Supabase
-    PKCE token endpoint, upserts a `users` row in the database (via the
-    Supabase Admin REST API) with role='player', then redirects to the
-    configured FRONTEND_URL with the tokens in the URL fragment.
+    PKCE token endpoint, then upserts or merges a `users` row:
 
-    Security guarantees:
-    - Tokens are placed in the URL *fragment* (#), never in query params (?).
-      Fragment values are not sent to the server and do not appear in Referer
-      headers or server logs.
-    - token_type returned by Supabase is validated against an allowlist.
-    - No internal error details are returned in response bodies.
-    - Network errors map to 503; Supabase auth errors map to 400.
+    - New user or same-provider re-login: INSERT ... ON CONFLICT DO UPDATE (upsert).
+    - Cross-provider merge (same email, different UID): PATCH the existing row
+      preserving the original users.id by PATCHing that existing row instead of
+      inserting a new one.
     """
 
     def get(self, request):
@@ -533,6 +529,9 @@ class AuthCallbackView(View):
 
         # ------------------------------------------------------------------
         # Step 2: Upsert users row via Supabase Admin REST API
+        # With identity merge: if a row with the same email already exists
+        # under a different UID (e.g. prior email/password signup), preserve
+        # the original UID by updating that row instead of inserting a new one.
         # ------------------------------------------------------------------
         user_id = user_data.get("id")
         email = user_data.get("email", "")
@@ -540,34 +539,126 @@ class AuthCallbackView(View):
         avatar_url = (user_data.get("user_metadata") or {}).get("avatar_url", "")
 
         if user_id:
-            upsert_endpoint = f"{supabase_url}/rest/v1/users"
-            upsert_payload = {
-                "id": user_id,
-                "email": email,
-                "full_name": full_name,
-                "avatar_url": avatar_url,
-                "role": "player",
+            admin_headers = {
+                "apikey": supabase_service_key,
+                "Authorization": f"Bearer {supabase_service_key}",
+                "Content-Type": "application/json",
             }
-            try:
-                requests.post(
-                    upsert_endpoint,
-                    json=upsert_payload,
-                    headers={
-                        "apikey": supabase_service_key,
-                        "Authorization": f"Bearer {supabase_service_key}",
-                        "Content-Type": "application/json",
-                        # Prefer=resolution=merge-duplicates instructs PostgREST to
-                        # do an upsert (INSERT ... ON CONFLICT DO UPDATE).
-                        "Prefer": "resolution=merge-duplicates",
-                    },
-                    timeout=10,
+            users_endpoint = f"{supabase_url}/rest/v1/users"
+
+            # ------------------------------------------------------------------
+            # Step 2a: Look up existing users row by email to detect merge case.
+            # ------------------------------------------------------------------
+            existing_uid = None
+            if email:
+                encoded_email = urllib.parse.quote(email, safe="")
+                lookup_endpoint = f"{users_endpoint}?email=eq.{encoded_email}&select=id,email"
+                try:
+                    lookup_resp = requests.get(
+                        lookup_endpoint,
+                        headers=admin_headers,
+                        timeout=10,
+                    )
+                except requests.RequestException as exc:
+                    logger.error("Supabase users lookup failed: %s", exc)
+                    return JsonResponse(
+                        {"error": "User profile service unavailable."},
+                        status=503,
+                    )
+
+                if lookup_resp.status_code != 200:
+                    logger.error(
+                        "Supabase users lookup returned %s: %s",
+                        lookup_resp.status_code,
+                        lookup_resp.text,
+                    )
+                    return JsonResponse(
+                        {"error": "User profile service unavailable."},
+                        status=503,
+                    )
+
+                try:
+                    rows = lookup_resp.json()
+                    if rows and isinstance(rows, list):
+                        existing_uid = rows[0].get("id")
+                except (ValueError, AttributeError):
+                    existing_uid = None
+
+            # ------------------------------------------------------------------
+            # Step 2b: Merge or upsert.
+            # Merge: existing row with a DIFFERENT UID found → update that row,
+            #        preserving the original users.id (the key invariant).
+            # No merge: same UID or no existing row → normal upsert.
+            # ------------------------------------------------------------------
+            if existing_uid and existing_uid != user_id:
+                # Identity merge: user signed up with email/password before,
+                # now signing in with Google using the same email.
+                # Preserve the original UID by updating the existing row.
+                logger.info(
+                    "Merging identities: email=%s original_uid=%s new_uid=%s",
+                    email,
+                    existing_uid,
+                    user_id,
                 )
-            except requests.RequestException as exc:
-                logger.error("Supabase users upsert failed: %s", exc)
-                return JsonResponse(
-                    {"error": "User profile service unavailable."},
-                    status=503,
-                )
+                merge_endpoint = f"{users_endpoint}?id=eq.{existing_uid}"
+                merge_payload = {
+                    "full_name": full_name,
+                    "avatar_url": avatar_url,
+                    "role": "player",
+                }
+                try:
+                    patch_resp = requests.patch(
+                        merge_endpoint,
+                        json=merge_payload,
+                        headers={
+                            **admin_headers,
+                            "Prefer": "return=minimal",
+                        },
+                        timeout=10,
+                    )
+                except requests.RequestException as exc:
+                    logger.error("Supabase users merge update failed: %s", exc)
+                    return JsonResponse(
+                        {"error": "User profile service unavailable."},
+                        status=503,
+                    )
+                if not (200 <= patch_resp.status_code < 300):
+                    logger.error(
+                        "Supabase users merge update returned %s: %s",
+                        patch_resp.status_code,
+                        patch_resp.text,
+                    )
+                    return JsonResponse(
+                        {"error": "User profile service unavailable."},
+                        status=503,
+                    )
+            else:
+                # Normal upsert: either new user or same provider re-login.
+                upsert_payload = {
+                    "id": user_id,
+                    "email": email,
+                    "full_name": full_name,
+                    "avatar_url": avatar_url,
+                    "role": "player",
+                }
+                try:
+                    requests.post(
+                        users_endpoint,
+                        json=upsert_payload,
+                        headers={
+                            **admin_headers,
+                            # Prefer=resolution=merge-duplicates instructs PostgREST to
+                            # do an upsert (INSERT ... ON CONFLICT DO UPDATE).
+                            "Prefer": "resolution=merge-duplicates",
+                        },
+                        timeout=10,
+                    )
+                except requests.RequestException as exc:
+                    logger.error("Supabase users upsert failed: %s", exc)
+                    return JsonResponse(
+                        {"error": "User profile service unavailable."},
+                        status=503,
+                    )
 
         # ------------------------------------------------------------------
         # Step 3: Redirect to frontend with tokens in URL fragment

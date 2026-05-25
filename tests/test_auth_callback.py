@@ -52,11 +52,20 @@ def _make_upsert_response():
     return mock_resp
 
 
+def _make_lookup_no_existing():
+    """Build a mock lookup response with no existing user row."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = []
+    return mock_resp
+
+
 @override_settings(
     SUPABASE_URL="https://xyzproject.supabase.co",
     SUPABASE_ANON_KEY="anon-key-test",
     SUPABASE_SERVICE_ROLE_KEY="service-role-key-test",
     FRONTEND_URL="https://app.example.com",
+    ALLOWED_HOSTS=["testserver", "localhost"],
 )
 class AuthCallbackViewTests(TestCase):
     """Tests for GET /auth/callback."""
@@ -72,9 +81,11 @@ class AuthCallbackViewTests(TestCase):
     def test_success_redirects_with_tokens_in_fragment(self):
         """Valid code → tokens exchanged → redirect with tokens in URL fragment."""
         token_resp = _make_token_response()
+        lookup_resp = _make_lookup_no_existing()
         upsert_resp = _make_upsert_response()
 
-        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]):
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]), \
+             patch("auth_ext.views.requests.get", return_value=lookup_resp):
             resp = self.client.get(self.url, {"code": "test-auth-code"})
 
         self.assertEqual(resp.status_code, 302)
@@ -93,9 +104,11 @@ class AuthCallbackViewTests(TestCase):
             access_token="my.access.token",
             refresh_token="my.refresh.token",
         )
+        lookup_resp = _make_lookup_no_existing()
         upsert_resp = _make_upsert_response()
 
-        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]):
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]), \
+             patch("auth_ext.views.requests.get", return_value=lookup_resp):
             resp = self.client.get(self.url, {"code": "test-auth-code"})
 
         location = resp["Location"]
@@ -108,9 +121,11 @@ class AuthCallbackViewTests(TestCase):
     def test_success_calls_supabase_token_endpoint(self):
         """View must call Supabase PKCE token endpoint with the code."""
         token_resp = _make_token_response()
+        lookup_resp = _make_lookup_no_existing()
         upsert_resp = _make_upsert_response()
 
-        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post:
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post, \
+             patch("auth_ext.views.requests.get", return_value=lookup_resp):
             self.client.get(self.url, {"code": "exchange-code-xyz"})
 
         first_call = mock_post.call_args_list[0]
@@ -123,9 +138,11 @@ class AuthCallbackViewTests(TestCase):
     def test_success_upserts_users_row(self):
         """After token exchange, view must upsert a users row."""
         token_resp = _make_token_response()
+        lookup_resp = _make_lookup_no_existing()
         upsert_resp = _make_upsert_response()
 
-        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post:
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post, \
+             patch("auth_ext.views.requests.get", return_value=lookup_resp):
             self.client.get(self.url, {"code": "test-code"})
 
         # Second call must be the upsert
@@ -137,9 +154,11 @@ class AuthCallbackViewTests(TestCase):
     def test_upserted_user_has_player_role(self):
         """Upserted users row must have role='player'."""
         token_resp = _make_token_response()
+        lookup_resp = _make_lookup_no_existing()
         upsert_resp = _make_upsert_response()
 
-        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post:
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]) as mock_post, \
+             patch("auth_ext.views.requests.get", return_value=lookup_resp):
             self.client.get(self.url, {"code": "test-code"})
 
         upsert_call = mock_post.call_args_list[1]
@@ -209,11 +228,12 @@ class AuthCallbackViewTests(TestCase):
         """Network error on DB upsert → 503."""
         import requests as req_lib
         token_resp = _make_token_response()
+        lookup_resp = _make_lookup_no_existing()
 
         with patch(
             "auth_ext.views.requests.post",
             side_effect=[token_resp, req_lib.RequestException("db timeout")],
-        ):
+        ), patch("auth_ext.views.requests.get", return_value=lookup_resp):
             resp = self.client.get(self.url, {"code": "any-code"})
 
         self.assertEqual(resp.status_code, 503)
@@ -228,9 +248,11 @@ class AuthCallbackViewTests(TestCase):
             access_token="secret.access",
             refresh_token="secret.refresh",
         )
+        lookup_resp = _make_lookup_no_existing()
         upsert_resp = _make_upsert_response()
 
-        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]):
+        with patch("auth_ext.views.requests.post", side_effect=[token_resp, upsert_resp]), \
+             patch("auth_ext.views.requests.get", return_value=lookup_resp):
             resp = self.client.get(self.url, {"code": "test-code"})
 
         location = resp["Location"]
