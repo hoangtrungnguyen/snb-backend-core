@@ -1,7 +1,8 @@
 from django.urls import path
-from .views import OwnerLoginView, OwnerForgotPasswordView
+from .views import OwnerLoginView, OwnerForgotPasswordView, TokenRefreshView
 
 urlpatterns = [
     path("owner/login", OwnerLoginView.as_view(), name="owner-login"),
     path("owner/forgot-password", OwnerForgotPasswordView.as_view(), name="owner-forgot-password"),
+    path("refresh", TokenRefreshView.as_view(), name="token-refresh"),
 ]
