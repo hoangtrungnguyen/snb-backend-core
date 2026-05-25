@@ -442,3 +442,91 @@ class AuthCallbackView(View):
             {"status": "verified", "access_token": access_token, "refresh_token": refresh_token},
             status=200,
         )
+
+
+# ---------------------------------------------------------------------------
+# Player auth
+# ---------------------------------------------------------------------------
+
+def _supabase_token_request(email: str, password: str) -> requests.Response:
+    """
+    Make a signInWithPassword request to the Supabase Auth REST API.
+
+    Returns the raw requests.Response.
+    Raises requests.RequestException on network failure.
+    """
+    supabase_url = getattr(settings, "SUPABASE_URL", "")
+    supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+    token_endpoint = f"{supabase_url}/auth/v1/token"
+
+    return requests.post(
+        token_endpoint,
+        params={"grant_type": "password"},
+        json={"email": email, "password": password},
+        headers={
+            "apikey": supabase_anon_key,
+            "Content-Type": "application/json",
+        },
+        timeout=10,
+    )
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PlayerLoginView(View):
+    """Handle POST /auth/player/login by delegating to Supabase Auth.
+
+    Differences from OwnerLoginView:
+    - Does NOT check for owner role — any role is accepted.
+    - Returns generic 401 {"error": "invalid_credentials"} on bad credentials
+      (no enumeration of whether email or password was wrong).
+    - Still checks email_confirmed_at IS NOT NULL → 403 {"error": "email_not_verified"}.
+    """
+
+    def post(self, request):
+        # Parse JSON body
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        email = body.get("email")
+        password = body.get("password")
+
+        if not email:
+            return JsonResponse({"error": "email is required."}, status=400)
+        if not password:
+            return JsonResponse({"error": "password is required."}, status=400)
+
+        try:
+            supabase_resp = _supabase_token_request(email, password)
+        except requests.RequestException as exc:
+            return JsonResponse(
+                {"error": "Authentication service unavailable.", "detail": str(exc)},
+                status=502,
+            )
+
+        if supabase_resp.status_code == 200:
+            data = supabase_resp.json()
+            user = data.get("user") or {}
+
+            # Enforce email verification: return 403 if email_confirmed_at is null.
+            if not user.get("email_confirmed_at"):
+                return JsonResponse(
+                    {"error": "email_not_verified"},
+                    status=403,
+                )
+
+            return JsonResponse(
+                {
+                    "access_token": data.get("access_token"),
+                    "refresh_token": data.get("refresh_token"),
+                    "user": user,
+                },
+                status=200,
+            )
+
+        # Supabase returned an error — always 401 with generic message (no enumeration).
+        return JsonResponse(
+            {"error": "invalid_credentials"},
+            status=401,
+        )
