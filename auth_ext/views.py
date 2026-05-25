@@ -650,3 +650,29 @@ class PlayerResendVerificationView(View):
             pass
 
         return JsonResponse({"message": "Verification email sent"}, status=200)
+
+
+class PlayerGoogleOAuthView(View):
+    """Handle GET /auth/player/google by redirecting to Supabase Google OAuth."""
+
+    def get(self, request):
+        supabase_url = getattr(settings, "SUPABASE_URL", "")
+
+        if not supabase_url:
+            return JsonResponse(
+                {"error": "Authentication service is unavailable."},
+                status=503,
+            )
+
+        # Build the callback URL this app will handle after OAuth completes.
+        # Client-supplied redirect_to is intentionally ignored to prevent open
+        # redirect attacks; post-auth routing is handled by the callback view.
+        callback_url = request.build_absolute_uri("/auth/callback")
+
+        params = urlencode({
+            "provider": "google",
+            "redirect_to": callback_url,
+        })
+        supabase_oauth_url = f"{supabase_url}/auth/v1/authorize?{params}"
+
+        return HttpResponseRedirect(supabase_oauth_url)
