@@ -452,24 +452,13 @@ class AuthCallbackView(View):
 # ---------------------------------------------------------------------------
 
 def _supabase_token_request(email: str, password: str) -> requests.Response:
-    """
-    Make a signInWithPassword request to the Supabase Auth REST API.
-
-    Returns the raw requests.Response.
-    Raises requests.RequestException on network failure.
-    """
     supabase_url = getattr(settings, "SUPABASE_URL", "")
     supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-    token_endpoint = f"{supabase_url}/auth/v1/token"
-
     return requests.post(
-        token_endpoint,
+        f"{supabase_url}/auth/v1/token",
         params={"grant_type": "password"},
         json={"email": email, "password": password},
-        headers={
-            "apikey": supabase_anon_key,
-            "Content-Type": "application/json",
-        },
+        headers={"apikey": supabase_anon_key, "Content-Type": "application/json"},
         timeout=10,
     )
 
@@ -478,13 +467,9 @@ def _supabase_token_request(email: str, password: str) -> requests.Response:
 class PlayerLoginView(View):
     """POST /auth/player/login — generic 401 for all 4xx (anti-enumeration)."""
 
-    _INVALID_CREDENTIALS_BODY = {
-        "error": "invalid_credentials",
-        "detail": "Invalid credentials",
-    }
+    _INVALID_CREDENTIALS_BODY = {"error": "invalid_credentials", "detail": "Invalid credentials"}
 
     def post(self, request):
-        # Parse JSON body
         try:
             body = json.loads(request.body)
         except (json.JSONDecodeError, ValueError):
@@ -492,7 +477,6 @@ class PlayerLoginView(View):
 
         email = body.get("email")
         password = body.get("password")
-
         if not email:
             return JsonResponse({"error": "email is required."}, status=400)
         if not password:
@@ -501,59 +485,29 @@ class PlayerLoginView(View):
         try:
             supabase_resp = _supabase_token_request(email, password)
         except requests.RequestException:
-            # Network / connection failures → 503 Service Unavailable.
-            # Must NOT return 401 — caller must be able to distinguish
-            # "bad credentials" from "upstream unavailable".
-            return JsonResponse(
-                {"error": "Authentication service unavailable."},
-                status=503,
-            )
+            return JsonResponse({"error": "Authentication service unavailable."}, status=503)
 
         if supabase_resp.status_code == 200:
             data = supabase_resp.json()
             user = data.get("user") or {}
-
-            # Enforce email verification: return 403 if email_confirmed_at is null.
             if not user.get("email_confirmed_at"):
-                return JsonResponse(
-                    {"error": "email_not_verified"},
-                    status=403,
-                )
-
+                return JsonResponse({"error": "email_not_verified"}, status=403)
             return JsonResponse(
-                {
-                    "access_token": data.get("access_token"),
-                    "refresh_token": data.get("refresh_token"),
-                    "user": user,
-                },
+                {"access_token": data.get("access_token"), "refresh_token": data.get("refresh_token"), "user": user},
                 status=200,
             )
 
-        # Any Supabase 4xx → uniform 401 with generic body (no enumeration).
         if 400 <= supabase_resp.status_code < 500:
             return JsonResponse(self._INVALID_CREDENTIALS_BODY, status=401)
 
-        # Supabase 5xx or unexpected status → 503
-        return JsonResponse(
-            {"error": "Authentication service unavailable."},
-            status=503,
-        )
+        return JsonResponse({"error": "Authentication service unavailable."}, status=503)
 
 
 @method_decorator(csrf_exempt, name="dispatch")
 class PlayerForgotPasswordView(View):
-    """Handle POST /auth/player/forgot-password by delegating to Supabase Auth.
-
-    Calls POST /auth/v1/recover with the player's email and a redirect_to URL
-    so the reset link in the Supabase email points back to the app's
-    /auth/callback?type=recovery page.
-
-    Always returns HTTP 200 regardless of whether the email exists or whether
-    Supabase itself returns an error — prevents user enumeration attacks.
-    """
+    """POST /auth/player/forgot-password — always 200 (anti-enumeration)."""
 
     def post(self, request):
-        # Parse JSON body
         try:
             body = json.loads(request.body)
         except (json.JSONDecodeError, ValueError):
@@ -567,21 +521,14 @@ class PlayerForgotPasswordView(View):
         supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
         app_base_url = getattr(settings, "APP_BASE_URL", "")
 
-        recover_endpoint = f"{supabase_url}/auth/v1/recover"
-        redirect_to = f"{app_base_url}/auth/callback?type=recovery"
-
         try:
             requests.post(
-                recover_endpoint,
-                json={"email": email, "redirect_to": redirect_to},
-                headers={
-                    "apikey": supabase_anon_key,
-                    "Content-Type": "application/json",
-                },
+                f"{supabase_url}/auth/v1/recover",
+                json={"email": email, "redirect_to": f"{app_base_url}/auth/callback?type=recovery"},
+                headers={"apikey": supabase_anon_key, "Content-Type": "application/json"},
                 timeout=10,
             )
         except requests.RequestException:
-            # Intentionally swallow — anti-enumeration requires always-200
             pass
 
         return JsonResponse({"message": _RESET_LINK_SENT_MSG}, status=200)
@@ -592,24 +539,9 @@ _RESEND_RATE_LIMIT_SECONDS = 60
 
 @method_decorator(csrf_exempt, name="dispatch")
 class PlayerResendVerificationView(View):
-    """Handle POST /auth/player/resend-verification.
-
-    Re-sends a Supabase signup verification email.  Enforces a 1-per-minute
-    rate limit per email address using Django's cache framework
-    (LocMemCache in dev, Redis-backed in production).
-
-    Cache key: ``resend_verification:{email}``
-    Cache value: Unix timestamp (float) of the last successful send.
-
-    Rate-limit response: 429 {"error": "rate_limited", "retry_after": <seconds>}
-    Success response:    200 {"message": "Verification email sent"}
-
-    Anti-enumeration: Supabase errors (including unknown-email errors) are
-    silently swallowed and still return 200.
-    """
+    """POST /auth/player/resend-verification — rate limit 1/min per email."""
 
     def post(self, request):
-        # Parse JSON body
         try:
             body = json.loads(request.body)
         except (json.JSONDecodeError, ValueError):
@@ -619,52 +551,27 @@ class PlayerResendVerificationView(View):
         if not email:
             return JsonResponse({"error": "validation_error", "detail": "email is required"}, status=400)
 
-        # --- Rate limit check ---
         cache_key = f"resend_verification:{email}"
         last_sent = cache.get(cache_key)
         if last_sent is not None:
-            elapsed = time.time() - last_sent
-            remaining = _RESEND_RATE_LIMIT_SECONDS - elapsed
+            remaining = _RESEND_RATE_LIMIT_SECONDS - (time.time() - last_sent)
             if remaining > 0:
-                return JsonResponse(
-                    {
-                        "error": "rate_limited",
-                        "retry_after": math.ceil(remaining),
-                    },
-                    status=429,
-                )
+                return JsonResponse({"error": "rate_limited", "retry_after": math.ceil(remaining)}, status=429)
 
-        # --- Set rate limit token before calling Supabase ---
-        # Setting it before the network call prevents a race condition where
-        # concurrent requests both slip through before the first one stores it.
-        now = time.time()
-        cache.set(cache_key, now, timeout=_RESEND_RATE_LIMIT_SECONDS)
+        cache.set(cache_key, time.time(), timeout=_RESEND_RATE_LIMIT_SECONDS)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
         supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
         app_base_url = getattr(settings, "APP_BASE_URL", "")
 
-        resend_endpoint = f"{supabase_url}/auth/v1/resend"
-        redirect_to = f"{app_base_url}/auth/callback?type=email"
-
         try:
             requests.post(
-                resend_endpoint,
-                json={
-                    "type": "signup",
-                    "email": email,
-                    "redirect_to": redirect_to,
-                },
-                headers={
-                    "apikey": supabase_anon_key,
-                    "Content-Type": "application/json",
-                },
+                f"{supabase_url}/auth/v1/resend",
+                json={"type": "signup", "email": email, "redirect_to": f"{app_base_url}/auth/callback?type=email"},
+                headers={"apikey": supabase_anon_key, "Content-Type": "application/json"},
                 timeout=10,
             )
         except requests.RequestException:
-            # Intentionally swallow — anti-enumeration requires always-200.
-            # The rate-limit token was already set above; the caller must wait
-            # the full 60 s before retrying regardless of the network outcome.
             pass
 
         return JsonResponse({"message": "Verification email sent"}, status=200)
