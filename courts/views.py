@@ -11,6 +11,7 @@ Endpoints:
   PATCH  /api/courts/slots/{id}/block    -- block a slot (owner only) [grava-3106.3]
   PATCH  /api/courts/slots/{id}/unblock  -- unblock a slot (owner only) [grava-3106.3]
   POST   /api/courts/{id}/recurrence     -- recurring slot schedule generation [grava-3106.4]
+  GET    /api/courts/by-slug/{slug}      -- court slug lookup (public) [grava-3106.6]
 
 grava-3106.1 subtasks:
   grava-3106.1.1 -- POST /courts
@@ -46,6 +47,13 @@ grava-3106.5 (BCORE-024 — Weekly schedule & slot detail queries):
       Slot detail: {id, court_id, court_name, start_at, end_at, duration_minutes,
                     status, access_policy, max_players, blocked_reason, booking_id, notes}.
       Used by OWNER-32 + booking-context lookups.
+
+grava-3106.6 (BCORE-025 — Court slug lookup):
+  GET /api/courts/by-slug/{slug}
+      Public. Resolves a court slug to a full court detail response.
+      Returns 404 if no court has that slug or status != approved.
+      Slug matching is case-insensitive (slug lowercased before query).
+      Used by the customer app deep-link router to resolve QR scans (screen 07).
 """
 import json
 import re
@@ -1717,6 +1725,73 @@ class SlotDetailView(View):
                 court_name = court_rows[0].get("name")
 
         return JsonResponse(_slot_to_detail_dict(slot, court_name=court_name), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-3106.6  GET /api/courts/by-slug/{slug}
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
+class CourtSlugLookupView(View):
+    """
+    GET /api/courts/by-slug/{slug}
+
+    Public endpoint. Resolves a court slug to a full court detail response.
+
+    Returns 404 if:
+      - No court has that slug.
+      - The matched court's status is not "approved".
+
+    Slug matching is case-insensitive (slug is lowercased before querying
+    Supabase via `ilike` / exact match on `lower(courts.slug)`).
+
+    Used by the customer app's deep-link router to resolve QR-code scans to
+    the court detail screen (CAPP screen 07).
+
+    grava-3106.6.1, grava-3106.6.2, grava-3106.6.3
+    """
+
+    def get(self, request, slug: str):
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # grava-3106.6.2 — case-insensitive: lowercase the slug before querying
+        normalized_slug = slug.lower()
+
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        try:
+            resp = requests.get(
+                courts_url,
+                params={
+                    "slug": f"eq.{normalized_slug}",
+                    "select": "*",
+                    "limit": "1",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        rows = resp.json()
+
+        # grava-3106.6.1 — 404 if slug not found
+        if not rows:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court = rows[0]
+
+        # grava-3106.6.1 — 404 if status is not approved
+        if court.get("status") != "approved":
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        return JsonResponse(_court_to_dict(court), status=200)
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
