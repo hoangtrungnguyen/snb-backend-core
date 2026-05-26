@@ -2,8 +2,10 @@
 series.views — Booking series endpoints.
 
 Endpoints:
-  POST /api/booking-series/preview  — Preview recurring occurrences without persisting
-  POST /api/booking-series          — Create a booking series
+  POST  /api/booking-series/preview        — Preview recurring occurrences without persisting
+  POST  /api/booking-series                — Create a booking series
+  GET   /api/booking-series/<id>           — Series detail with occurrences (grava-3432.8)
+  PATCH /api/booking-series/<id>/status    — Approve or cancel a series (grava-3432.8)
 
 grava-3432.7 / BCORE-036 acceptance criteria:
   grava-3432.7.1 / BCORE-149: POST /booking-series/preview
@@ -931,6 +933,490 @@ class BookingSeriesCreateView(View):
                 "updated_at": series.get("updated_at"),
             },
             status=201,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# Series Detail View (grava-3432.8 / BCORE-037)
+# ---------------------------------------------------------------------------
+
+# Booking status → session category mapping
+_STATUS_PLAYED = frozenset({"confirmed"})       # confirmed = played (or upcoming)
+_STATUS_UPCOMING = frozenset({"pending", "confirmed"})  # upcoming = not yet completed/cancelled
+_STATUS_CANCELLED = frozenset({"cancelled"})
+
+
+def _date_from_iso(ts: str) -> str:
+    """Extract 'YYYY-MM-DD' date from an ISO 8601 timestamp string."""
+    try:
+        return ts[:10]
+    except Exception:
+        return ""
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BookingSeriesDetailView(View):
+    """
+    GET /api/booking-series/<series_id>
+
+    Returns a series with its occurrence list.  Drives CAPP-055 progress bar.
+
+    Access rules:
+      - Series player (user_id = caller): may view their own series.
+      - Court owner (court.owner_id = caller): may view any series for their court.
+
+    Response 200:
+      {
+        "id":                  "<uuid>",
+        "court_id":            "<uuid>",
+        "court_name":          "<str>",
+        "pattern":             "weekly",
+        "days_of_week":        ["mon", ...],
+        "start_time":          "HH:MM",
+        "end_time":            "HH:MM",
+        "valid_from":          "YYYY-MM-DD",
+        "valid_until":         "YYYY-MM-DD" | null,
+        "status":              "pending" | "confirmed" | "cancelled",
+        "total_sessions":      <int>,
+        "sessions_played":     <int>,   # confirmed bookings
+        "sessions_upcoming":   <int>,   # pending + confirmed bookings
+        "sessions_cancelled":  <int>,   # cancelled bookings
+        "occurrences":         [{"booking_id", "slot_id", "date", "start_at", "end_at", "status"}]
+      }
+
+    Error responses:
+      401 — missing / invalid token
+      403 — not the series player and not the court owner
+      404 — series not found
+      503 — upstream service unavailable
+    """
+
+    def get(self, request, series_id: str):
+        user, err = _require_authenticated(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # --- Fetch series ---
+        series = _fetch_one(
+            f"{supabase_url}/rest/v1/booking_series",
+            params={"id": f"eq.{series_id}", "select": "*", "limit": "1"},
+            headers=headers,
+        )
+        if series == "error":
+            return JsonResponse({"error": "Series service unavailable."}, status=503)
+        if series is None:
+            return JsonResponse({"error": "Booking series not found."}, status=404)
+
+        court_id: str = series.get("court_id", "")
+        series_user_id: str = series.get("user_id", "")
+
+        # --- Fetch court (for access control + court name) ---
+        court = _fetch_one(
+            f"{supabase_url}/rest/v1/courts",
+            params={"id": f"eq.{court_id}", "select": "id,owner_id,name", "limit": "1"},
+            headers=headers,
+        )
+        if court == "error":
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+        if court is None:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court_owner_id: str = court.get("owner_id", "")
+        court_name: str = court.get("name", "")
+
+        # --- Access control ---
+        is_series_player = (user.id == series_user_id)
+        is_court_owner = (user.id == court_owner_id)
+        if not is_series_player and not is_court_owner:
+            return JsonResponse(
+                {"error": "You do not have access to this booking series."}, status=403
+            )
+
+        # --- Fetch bookings for this series ---
+        bookings_result = _fetch_list(
+            f"{supabase_url}/rest/v1/bookings",
+            params={
+                "booking_series_id": f"eq.{series_id}",
+                "select": "id,slot_id,status",
+                "order": "created_at.asc",
+            },
+            headers=headers,
+        )
+        if bookings_result == "error":
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+
+        bookings = bookings_result or []
+
+        # --- Build occurrences list — fetch slot timestamps for each booking ---
+        occurrences = []
+        sessions_played = 0
+        sessions_upcoming = 0
+        sessions_cancelled = 0
+
+        for booking in bookings:
+            b_status: str = booking.get("status", "")
+            b_slot_id: str = booking.get("slot_id", "")
+
+            # Fetch slot to get timestamps
+            slot = _fetch_one(
+                f"{supabase_url}/rest/v1/slots",
+                params={"id": f"eq.{b_slot_id}", "select": "id,start_at,end_at", "limit": "1"},
+                headers=headers,
+            )
+            start_at = ""
+            end_at = ""
+            if slot and slot != "error":
+                start_at = slot.get("start_at", "")
+                end_at = slot.get("end_at", "")
+
+            occurrences.append({
+                "booking_id": booking.get("id"),
+                "slot_id": b_slot_id,
+                "date": _date_from_iso(start_at),
+                "start_at": start_at,
+                "end_at": end_at,
+                "status": b_status,
+            })
+
+            if b_status in _STATUS_PLAYED:
+                sessions_played += 1
+            if b_status in _STATUS_UPCOMING:
+                sessions_upcoming += 1
+            if b_status in _STATUS_CANCELLED:
+                sessions_cancelled += 1
+
+        total_sessions = len(bookings)
+
+        # --- Derive valid_until from series metadata ---
+        ec_type = series.get("end_condition_type")
+        ec_value = series.get("end_condition_value")
+        valid_until = None
+        if ec_type == "until_date" and ec_value:
+            valid_until = str(ec_value)
+
+        return JsonResponse(
+            {
+                "id": series.get("id"),
+                "court_id": court_id,
+                "court_name": court_name,
+                "pattern": series.get("pattern"),
+                "days_of_week": series.get("days_of_week"),
+                "start_time": series.get("start_time"),
+                "end_time": series.get("end_time"),
+                "valid_from": series.get("valid_from"),
+                "valid_until": valid_until,
+                "status": series.get("status"),
+                "total_sessions": total_sessions,
+                "sessions_played": sessions_played,
+                "sessions_upcoming": sessions_upcoming,
+                "sessions_cancelled": sessions_cancelled,
+                "occurrences": occurrences,
+            },
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# Series Status View (grava-3432.8 / BCORE-037)
+# ---------------------------------------------------------------------------
+
+# Valid target statuses for series
+_VALID_SERIES_TARGET_STATUSES = frozenset({"confirmed", "cancelled"})
+
+# Allowed transitions: (current_status, target_status) → frozenset of actor roles
+# Actor roles: "court_owner" = court owner, "series_player" = the booking's player
+_SERIES_TRANSITION_RULES: dict[tuple[str, str], frozenset[str]] = {
+    # pending → confirmed: court owner only (OWNER-27)
+    ("pending", "confirmed"): frozenset({"court_owner"}),
+    # pending → cancelled: court owner OR series player (OWNER-27 / CAPP-056)
+    ("pending", "cancelled"): frozenset({"court_owner", "series_player"}),
+    # confirmed → cancelled: court owner OR series player
+    ("confirmed", "cancelled"): frozenset({"court_owner", "series_player"}),
+}
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BookingSeriesStatusView(View):
+    """
+    PATCH /api/booking-series/<series_id>/status
+
+    Transition a booking series status.
+
+    Allowed transitions:
+      pending   → confirmed  (court owner only — OWNER-27)
+      pending   → cancelled  (court owner OR series player — OWNER-27 / CAPP-056)
+      confirmed → cancelled  (court owner OR series player)
+
+    On approve (→ confirmed):
+      - All pending bookings in the series → confirmed (slots stay booked).
+      - Series row status → confirmed.
+      - Player receives notification: "Lịch cố định đã được duyệt"
+
+    On cancel (→ cancelled):
+      - All pending/confirmed bookings → cancelled.
+      - Each cancelled booking's slot → open (best-effort).
+      - Series row status → cancelled.
+      - Player receives notification if cancelled by owner.
+
+    Request body: { "status": "confirmed" | "cancelled" }
+
+    Responses:
+      200 — updated series summary
+      400 — missing/invalid status, or invalid JSON
+      401 — no/invalid token
+      403 — not authorised for this transition
+      404 — series not found
+      409 — transition not allowed from current state
+      503 — upstream error
+    """
+
+    def patch(self, request, series_id: str):
+        # --- Auth ---
+        user, err = _require_authenticated(request)
+        if err is not None:
+            return err
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
+        target_status = body.get("status")
+        if not target_status or not isinstance(target_status, str):
+            return JsonResponse({"error": "status is required."}, status=400)
+
+        target_status = target_status.strip()
+        if target_status not in _VALID_SERIES_TARGET_STATUSES:
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Invalid status '{target_status}'. "
+                        f"Must be one of: {', '.join(sorted(_VALID_SERIES_TARGET_STATUSES))}."
+                    )
+                },
+                status=400,
+            )
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # --- Fetch series ---
+        series = _fetch_one(
+            f"{supabase_url}/rest/v1/booking_series",
+            params={"id": f"eq.{series_id}", "select": "*", "limit": "1"},
+            headers=headers,
+        )
+        if series == "error":
+            return JsonResponse({"error": "Series service unavailable."}, status=503)
+        if series is None:
+            return JsonResponse({"error": "Booking series not found."}, status=404)
+
+        current_status: str = series.get("status", "")
+        series_user_id: str = series.get("user_id", "")
+        court_id: str = series.get("court_id", "")
+
+        # --- Fetch court ---
+        court = _fetch_one(
+            f"{supabase_url}/rest/v1/courts",
+            params={"id": f"eq.{court_id}", "select": "id,owner_id,name", "limit": "1"},
+            headers=headers,
+        )
+        if court == "error":
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+        if court is None:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court_owner_id: str = court.get("owner_id", "")
+        court_name: str = court.get("name", "")
+
+        # --- Determine actor roles ---
+        actor_roles: set[str] = set()
+        if user.id == court_owner_id:
+            actor_roles.add("court_owner")
+        if user.id == series_user_id:
+            actor_roles.add("series_player")
+
+        # --- Validate transition ---
+        transition_key = (current_status, target_status)
+        allowed_actors = _SERIES_TRANSITION_RULES.get(transition_key)
+
+        if allowed_actors is None:
+            if current_status == target_status:
+                return JsonResponse(
+                    {"error": f"Series is already in '{current_status}' status."},
+                    status=409,
+                )
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Cannot transition series from '{current_status}' "
+                        f"to '{target_status}'."
+                    )
+                },
+                status=409,
+            )
+
+        if not (actor_roles & allowed_actors):
+            return JsonResponse(
+                {"error": "You are not authorised to perform this status transition."},
+                status=403,
+            )
+
+        # --- Fetch all bookings for this series ---
+        bookings_result = _fetch_list(
+            f"{supabase_url}/rest/v1/bookings",
+            params={
+                "booking_series_id": f"eq.{series_id}",
+                "select": "id,slot_id,status",
+            },
+            headers=headers,
+        )
+        if bookings_result == "error":
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+
+        bookings = bookings_result or []
+
+        # --- Apply transition ---
+        if target_status == "confirmed":
+            # Approve: update all pending bookings → confirmed
+            for booking in bookings:
+                if booking.get("status") != "pending":
+                    continue
+                booking_id = booking.get("id", "")
+                try:
+                    requests.patch(
+                        f"{supabase_url}/rest/v1/bookings",
+                        params={"id": f"eq.{booking_id}", "select": "id"},
+                        json={"status": "confirmed"},
+                        headers=headers,
+                        timeout=10,
+                    )
+                except _RequestException:
+                    pass  # best-effort; individual booking update failure is non-fatal
+
+        elif target_status == "cancelled":
+            # Cancel: update all pending/confirmed bookings → cancelled; restore slots → open
+            for booking in bookings:
+                b_status = booking.get("status", "")
+                if b_status not in ("pending", "confirmed"):
+                    continue
+                booking_id = booking.get("id", "")
+                slot_id = booking.get("slot_id", "")
+
+                # Cancel the booking
+                try:
+                    requests.patch(
+                        f"{supabase_url}/rest/v1/bookings",
+                        params={"id": f"eq.{booking_id}", "select": "id"},
+                        json={"status": "cancelled"},
+                        headers=headers,
+                        timeout=10,
+                    )
+                except _RequestException:
+                    pass  # best-effort
+
+                # Restore slot → open
+                if slot_id:
+                    try:
+                        requests.patch(
+                            f"{supabase_url}/rest/v1/slots",
+                            params={"id": f"eq.{slot_id}", "select": "id"},
+                            json={"status": "open"},
+                            headers=headers,
+                            timeout=10,
+                        )
+                    except _RequestException:
+                        pass  # best-effort
+
+        # --- Update series status ---
+        try:
+            series_patch_resp = requests.patch(
+                f"{supabase_url}/rest/v1/booking_series",
+                params={"id": f"eq.{series_id}", "select": "*"},
+                json={"status": target_status},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Series service unavailable."}, status=503)
+
+        if series_patch_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to update series status."}, status=503)
+
+        updated_rows = series_patch_resp.json()
+        if not updated_rows:
+            return JsonResponse({"error": "Failed to update series status."}, status=503)
+
+        updated_series = updated_rows[0]
+
+        # --- Notifications ---
+        if target_status == "confirmed":
+            # Notify player: series approved
+            _send_notification(
+                supabase_url,
+                headers,
+                user_id=series_user_id,
+                title="Lịch cố định đã được duyệt",
+                body=(
+                    f"Lịch cố định của bạn tại {court_name} đã được duyệt."
+                ),
+                related_series_id=series_id,
+            )
+        elif target_status == "cancelled":
+            # Notify the other party:
+            # - If owner cancelled → notify player
+            # - If player cancelled → notify owner
+            if "court_owner" in actor_roles and "series_player" not in actor_roles:
+                # Owner-initiated cancel: notify player
+                _send_notification(
+                    supabase_url,
+                    headers,
+                    user_id=series_user_id,
+                    title="Lịch cố định bị huỷ",
+                    body=f"Lịch cố định của bạn tại {court_name} đã bị huỷ bởi chủ sân.",
+                    related_series_id=series_id,
+                )
+            elif "series_player" in actor_roles and "court_owner" not in actor_roles:
+                # Player-initiated cancel: notify owner
+                _send_notification(
+                    supabase_url,
+                    headers,
+                    user_id=court_owner_id,
+                    title="Lịch cố định bị huỷ",
+                    body=f"Lịch cố định tại {court_name} đã bị huỷ bởi người chơi.",
+                    related_series_id=series_id,
+                )
+            else:
+                # Both roles (owner is also the series player) — notify player
+                _send_notification(
+                    supabase_url,
+                    headers,
+                    user_id=series_user_id,
+                    title="Lịch cố định bị huỷ",
+                    body=f"Lịch cố định của bạn tại {court_name} đã bị huỷ.",
+                    related_series_id=series_id,
+                )
+
+        return JsonResponse(
+            {
+                "id": updated_series.get("id"),
+                "court_id": court_id,
+                "status": updated_series.get("status"),
+            },
+            status=200,
         )
 
     def http_method_not_allowed(self, request, *args, **kwargs):
