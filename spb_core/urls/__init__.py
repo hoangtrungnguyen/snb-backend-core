@@ -15,6 +15,7 @@ from courts.views import (
     SlotJoinRequestRejectView,
     SlotParticipantsView,
     SlotJoinStatusView,
+    SlotLastMinuteView,
 )
 
 urlpatterns = [
@@ -72,5 +73,11 @@ urlpatterns = [
         "api/slot-join-requests/<str:join_request_id>/reject",
         SlotJoinRequestRejectView.as_view(),
         name="slot-join-request-reject",
+    ),
+    # grava-52bc.4 — last-minute slot push notification
+    path(
+        "api/slots/<str:slot_id>/last-minute",
+        SlotLastMinuteView.as_view(),
+        name="slot-last-minute",
     ),
 ]

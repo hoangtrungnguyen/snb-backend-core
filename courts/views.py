@@ -2733,3 +2733,152 @@ class CourtSettingsView(View):
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-52bc.4  POST /api/slots/{id}/last-minute
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotLastMinuteView(View):
+    """
+    POST /api/slots/{id}/last-minute
+
+    Owner marks a slot as last-minute available and triggers FCM push
+    notifications to nearby users.
+
+    Steps:
+    1. Authenticate caller — must be owner role.
+    2. Fetch slot; return 404 if not found.
+    3. Fetch court; verify caller is the court owner → 403 if not.
+    4. PATCH slots.is_last_minute = true.
+    5. Query nearby users (within 5 km of court) via notifications.last_minute.
+    6. Dispatch FCM multicast with rate-limit deduplication.
+    7. Return updated slot dict.
+
+    Response 200: updated slot object with is_last_minute=True
+    Response 401: not authenticated
+    Response 403: not owner / wrong owner
+    Response 404: slot not found
+    Response 503: upstream error
+
+    grava-52bc.4.1 — grava-52bc.4.5
+    """
+
+    def post(self, request, slot_id: str):
+        # --- Auth: owner only (grava-52bc.4.1) ---
+        user, err = _require_owner(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # --- Fetch slot ---
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        try:
+            slot_resp = requests.get(
+                slots_url,
+                params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slot_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        slot_rows = slot_resp.json()
+        if not slot_rows:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        slot = slot_rows[0]
+        court_id = slot.get("court_id")
+
+        # --- Fetch court; verify ownership ---
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        try:
+            court_resp = requests.get(
+                courts_url,
+                params={"id": f"eq.{court_id}", "select": "id,owner_id,name,lat,lng", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if court_resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        court_rows = court_resp.json()
+        if not court_rows:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court = court_rows[0]
+        if court.get("owner_id") != user.id:
+            return JsonResponse(
+                {"error": "You do not have permission to modify this slot."}, status=403
+            )
+
+        # --- PATCH slot: set is_last_minute = true (grava-52bc.4.1) ---
+        try:
+            patch_resp = requests.patch(
+                slots_url,
+                params={"id": f"eq.{slot_id}", "select": "*"},
+                json={"is_last_minute": True},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if patch_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to update slot."}, status=503)
+
+        updated_rows = patch_resp.json()
+        if not updated_rows:
+            return JsonResponse({"error": "Failed to update slot."}, status=503)
+
+        updated_slot = updated_rows[0]
+
+        # --- Location-based FCM dispatch (grava-52bc.4.2 — grava-52bc.4.5) ---
+        court_lat = court.get("lat")
+        court_lng = court.get("lng")
+        court_name = court.get("name") or ""
+
+        if court_lat is not None and court_lng is not None:
+            try:
+                from notifications.last_minute import (
+                    query_nearby_users,
+                    dispatch_last_minute_push,
+                )
+
+                nearby_users = query_nearby_users(
+                    court_lat=float(court_lat),
+                    court_lng=float(court_lng),
+                    radius_meters=5000,
+                )
+
+                dispatch_last_minute_push(
+                    slot_id=slot_id,
+                    court_id=court_id,
+                    court_name=court_name,
+                    nearby_users=nearby_users,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Push failure is non-fatal — slot was already marked is_last_minute
+                import logging as _logging
+                _logging.getLogger(__name__).error(
+                    "SlotLastMinuteView: push dispatch error for slot %s: %s",
+                    slot_id, exc,
+                )
+
+        # --- Return updated slot ---
+        slot_dict = _slot_to_dict(updated_slot)
+        slot_dict["is_last_minute"] = updated_slot.get("is_last_minute", True)
+        return JsonResponse(slot_dict, status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
