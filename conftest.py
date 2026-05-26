@@ -1,5 +1,5 @@
 """
-pytest configuration — sets up Django before test collection.
+pytest configuration -- sets up Django before test collection.
 """
 import os
 import django

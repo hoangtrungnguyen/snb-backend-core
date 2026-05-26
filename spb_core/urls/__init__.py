@@ -12,4 +12,5 @@ urlpatterns = [
     path("health/", health, name="health"),
     path("auth/", include("auth_ext.urls")),
     path("api/players/", include("players.urls")),
+    path("api/courts/", include("courts.urls")),
 ]
