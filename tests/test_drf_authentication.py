@@ -17,8 +17,7 @@ import pytest
 from django.test import RequestFactory
 from rest_framework.exceptions import AuthenticationFailed
 
-from auth_ext.authentication import SupabaseJWTAuthentication
-from auth_ext.middleware import AuthenticatedUser
+from auth_ext.authentication import SupabaseJWTAuthentication, SupabaseUser
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +41,8 @@ VALID_CLAIMS = {
     "app_metadata": {"role": "player"},
     "aud": "authenticated",
 }
+
+FAKE_DB_USER = {"id": "user-uuid-123", "role": "player", "email": "test@example.com"}
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,8 @@ class TestSupabaseJWTAuthentication:
     def test_valid_token_returns_user_token_tuple(self, mock_decode):
         raw_token = "a.valid.jwt"
         request = _make_request(f"Bearer {raw_token}")
-        result = self.authenticator.authenticate(request)
+        with patch.object(self.authenticator, "_fetch_user_from_db", return_value=FAKE_DB_USER):
+            result = self.authenticator.authenticate(request)
 
         assert result is not None
         user, token = result
@@ -109,20 +111,20 @@ class TestSupabaseJWTAuthentication:
     @patch("auth_ext.authentication._decode_token", return_value=VALID_CLAIMS)
     def test_valid_token_user_has_correct_fields(self, mock_decode):
         request = _make_request("Bearer a.valid.jwt")
-        user, token = self.authenticator.authenticate(request)
+        with patch.object(self.authenticator, "_fetch_user_from_db", return_value=FAKE_DB_USER):
+            user, token = self.authenticator.authenticate(request)
 
-        assert isinstance(user, AuthenticatedUser)
+        assert isinstance(user, SupabaseUser)
         assert user.id == "user-uuid-123"
-        assert user.email == "test@example.com"
         assert user.role == "player"
         assert user.is_authenticated is True
-        assert user.is_anonymous is False
 
     @patch("auth_ext.authentication._decode_token", return_value=VALID_CLAIMS)
     def test_valid_token_decode_called_with_raw_token(self, mock_decode):
         raw_token = "header.payload.sig"
         request = _make_request(f"Bearer {raw_token}")
-        self.authenticator.authenticate(request)
+        with patch.object(self.authenticator, "_fetch_user_from_db", return_value=FAKE_DB_USER):
+            self.authenticator.authenticate(request)
         mock_decode.assert_called_once_with(raw_token)
 
     # ------------------------------------------------------------------
@@ -133,10 +135,12 @@ class TestSupabaseJWTAuthentication:
         "auth_ext.authentication._decode_token",
         return_value={"sub": "u1", "email": "a@b.com"},
     )
-    def test_missing_role_defaults_to_user(self, mock_decode):
+    def test_missing_role_defaults_to_authenticated(self, mock_decode):
         request = _make_request("Bearer some.jwt.token")
-        user, _ = self.authenticator.authenticate(request)
-        assert user.role == "user"
+        db_user_no_role = {"id": "u1"}
+        with patch.object(self.authenticator, "_fetch_user_from_db", return_value=db_user_no_role):
+            user, _ = self.authenticator.authenticate(request)
+        assert user.role == "authenticated"
 
 
 # ---------------------------------------------------------------------------

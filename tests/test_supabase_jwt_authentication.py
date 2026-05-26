@@ -261,12 +261,14 @@ class TestDecodeJwt:
         assert "supabase" in called_url.lower() or "jwks" in called_url.lower()
 
     def test_decode_jwt_raises_on_network_error(self):
-        import requests as req_lib
+        # _decode_jwt now delegates to _decode_token which catches network errors
+        # internally and returns None, causing _decode_jwt to raise JWTError.
+        from jose import JWTError as JoseJWTError
 
         auth = SupabaseJWTAuthentication()
 
-        with patch("auth_ext.authentication.requests.get", side_effect=req_lib.RequestException("timeout")):
-            with pytest.raises(req_lib.RequestException):
+        with patch("auth_ext.authentication._decode_token", return_value=None):
+            with pytest.raises(JoseJWTError):
                 auth._decode_jwt(FAKE_TOKEN)
 
 

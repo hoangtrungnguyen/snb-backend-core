@@ -34,6 +34,7 @@ class OwnerLoginViewTests(TestCase):
                 "id": "user-uuid-123",
                 "email": "owner@example.com",
                 "role": "authenticated",
+                "email_confirmed_at": "2024-01-01T00:00:00Z",
             },
         }
         return mock_resp
@@ -45,8 +46,12 @@ class OwnerLoginViewTests(TestCase):
     def test_login_success_returns_tokens_and_user(self):
         """Valid credentials → 200 with access_token, refresh_token, user."""
         mock_resp = self._mock_supabase_success()
+        mock_role_resp = MagicMock()
+        mock_role_resp.status_code = 200
+        mock_role_resp.json.return_value = [{"role": "owner"}]
 
-        with patch("auth_ext.views.requests.post", return_value=mock_resp) as mock_post:
+        with patch("auth_ext.views.requests.post", return_value=mock_resp), \
+             patch("auth_ext.views.requests.get", return_value=mock_role_resp):
             resp = self.client.post(
                 self.url,
                 data=json.dumps({"email": "owner@example.com", "password": "secret"}),

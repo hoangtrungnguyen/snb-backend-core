@@ -23,6 +23,8 @@ from jose import ExpiredSignatureError, JWTError, jwt
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
 
+from auth_ext.middleware import _decode_token  # noqa: E402 — shared JWT decoder
+
 logger = logging.getLogger(__name__)
 
 _BEARER_PREFIX = "Bearer "
@@ -120,35 +122,22 @@ class SupabaseJWTAuthentication(BaseAuthentication):
         auth_header = request.META.get("HTTP_AUTHORIZATION", "")
         if not auth_header.startswith(_BEARER_PREFIX):
             return None
-        return auth_header[len(_BEARER_PREFIX):]
+        token = auth_header[len(_BEARER_PREFIX):].strip()
+        return token if token else None
 
     def _decode_jwt(self, token: str) -> dict:
         """
-        Fetch the Supabase JWKS and decode ``token`` using python-jose.
+        Decode ``token`` by delegating to the shared ``_decode_token`` decoder.
 
         Raises
         ------
-        requests.RequestException
-            On any network error while fetching the JWKS endpoint.
-        jose.ExpiredSignatureError
-            If the token's ``exp`` claim is in the past.
         jose.JWTError
-            For any other JWT validation failure (bad signature, algorithm, …).
+            If the token is invalid, expired, or validation fails (including
+            network errors when fetching JWKS).
         """
-        supabase_url = getattr(settings, "SUPABASE_URL", "")
-        jwks_url = f"{supabase_url}/auth/v1/.well-known/jwks.json"
-
-        resp = requests.get(jwks_url, timeout=10)
-        resp.raise_for_status()
-        jwks = resp.json()
-
-        # python-jose accepts the raw JWKS dict directly
-        payload = jwt.decode(
-            token,
-            jwks,
-            algorithms=["RS256"],
-            options={"verify_aud": False},  # Supabase aud varies by project
-        )
+        payload = _decode_token(token)
+        if payload is None:
+            raise JWTError("Token validation failed.")
         return payload
 
     def _fetch_user_from_db(self, uid: str) -> dict | None:

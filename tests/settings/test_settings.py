@@ -72,13 +72,16 @@ class TestSecretKeyRequired:
 
     def test_secret_key_raises_when_missing(self):
         """Importing base settings without SECRET_KEY in env must raise ImproperlyConfigured."""
+        import environ as environ_lib
         from django.core.exceptions import ImproperlyConfigured
 
         env_without_secret = {k: v for k, v in os.environ.items() if k != "SECRET_KEY"}
         # Also clear DATABASE_URL to avoid psycopg2 deps during test
         env_without_secret.pop("DATABASE_URL", None)
 
-        with mock.patch.dict(os.environ, env_without_secret, clear=True):
+        # Suppress read_env so the .env file on disk cannot inject SECRET_KEY
+        with mock.patch.dict(os.environ, env_without_secret, clear=True), \
+             mock.patch.object(environ_lib.Env, "read_env", staticmethod(lambda *a, **kw: None)):
             _clean_settings_modules()
             with pytest.raises((ImproperlyConfigured, KeyError)):
                 import spb_core.settings.base  # noqa: F401
