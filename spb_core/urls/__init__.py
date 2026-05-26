@@ -28,6 +28,8 @@ urlpatterns = [
     path("api/bookings", include("bookings.urls")),
     # grava-3432.7 — booking series preview & create
     path("api/booking-series", include("series.urls")),
+    # grava-52bc.2 — in-app notification dispatch
+    path("api/notifications", include("notifications.urls")),
     # grava-3106.5.2 — sports center schedule
     path(
         "api/sports-centers/<str:sc_id>/schedule",
