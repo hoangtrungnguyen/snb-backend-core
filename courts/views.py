@@ -1366,3 +1366,357 @@ class RecurrenceView(View):
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-3106.5 helpers
+# ---------------------------------------------------------------------------
+
+def _slot_to_detail_dict(slot_row: dict, court_name: str | None = None) -> dict:
+    """
+    Serialize a slot row to the full slot-detail shape (grava-3106.5.3).
+
+    Includes all fields required by OWNER-32 + booking-context lookups:
+      id, court_id, court_name, start_at, end_at, duration_minutes,
+      status, access_policy, max_players, blocked_reason, booking_id, notes.
+    """
+    start_at = slot_row.get("start_at")
+    end_at = slot_row.get("end_at")
+
+    # Compute duration_minutes from ISO timestamps when available.
+    duration_minutes = None
+    if start_at and end_at:
+        start_dt = _parse_iso_datetime(start_at)
+        end_dt = _parse_iso_datetime(end_at)
+        if start_dt and end_dt:
+            duration_minutes = int((end_dt - start_dt).total_seconds() // 60)
+
+    return {
+        "id": slot_row.get("id"),
+        "court_id": slot_row.get("court_id"),
+        "court_name": court_name,
+        "start_at": start_at,
+        "end_at": end_at,
+        "duration_minutes": duration_minutes,
+        "status": slot_row.get("status"),
+        "access_policy": slot_row.get("access_policy"),
+        "max_players": slot_row.get("max_players"),
+        "blocked_reason": slot_row.get("blocked_reason"),
+        "booking_id": slot_row.get("booking_id"),
+        "notes": slot_row.get("notes"),
+    }
+
+
+def _slot_to_range_dict(slot_row: dict) -> dict:
+    """
+    Serialize a slot row for the weekly-range / schedule views (grava-3106.5.1/5.2).
+
+    Includes status, booking_id, blocked_reason per grava-3106.5.4.
+    """
+    return {
+        "id": slot_row.get("id"),
+        "court_id": slot_row.get("court_id"),
+        "start_at": slot_row.get("start_at"),
+        "end_at": slot_row.get("end_at"),
+        "status": slot_row.get("status"),
+        "is_owner_slot": slot_row.get("is_owner_slot", False),
+        "access_policy": slot_row.get("access_policy"),
+        "max_players": slot_row.get("max_players"),
+        "blocked_reason": slot_row.get("blocked_reason"),
+        "booking_id": slot_row.get("booking_id"),
+        "notes": slot_row.get("notes"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# grava-3106.5.1  GET /api/courts/{id}/slots?from=DATE&to=DATE
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
+class CourtSlotsRangeView(View):
+    """
+    GET /api/courts/{id}/slots?from=DATE&to=DATE
+
+    Returns all slots for the given court within the date range.
+    Public endpoint — no auth required.
+
+    Query parameters:
+      from  YYYY-MM-DD  (required) — inclusive start date
+      to    YYYY-MM-DD  (required) — end date boundary
+
+    Response 200:
+      {"results": [<slot>, ...]}
+
+    Each slot includes: id, court_id, start_at, end_at, status, booking_id,
+    blocked_reason (grava-3106.5.4).
+    """
+
+    def get(self, request, court_id):
+        from_raw = request.GET.get("from")
+        to_raw = request.GET.get("to")
+
+        # --- Validate params ---
+        if not from_raw:
+            return JsonResponse({"error": "from query parameter is required."}, status=400)
+        if not to_raw:
+            return JsonResponse({"error": "to query parameter is required."}, status=400)
+
+        from_date = _parse_date(from_raw)
+        if from_date is None:
+            return JsonResponse(
+                {"error": f"from \"{from_raw}\" is not a valid YYYY-MM-DD date."}, status=400
+            )
+        to_date = _parse_date(to_raw)
+        if to_date is None:
+            return JsonResponse(
+                {"error": f"to \"{to_raw}\" is not a valid YYYY-MM-DD date."}, status=400
+            )
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # --- Fetch court (verify existence) ---
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        try:
+            court_resp = requests.get(
+                courts_url,
+                params={"id": f"eq.{court_id}", "select": "id", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if court_resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if not court_resp.json():
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        # --- Fetch slots in range ---
+        # Range: start_at >= from_date (midnight UTC) AND start_at < to_date (next midnight)
+        from_iso = f"{from_date.isoformat()}T00:00:00+00:00"
+        to_iso = f"{to_date.isoformat()}T00:00:00+00:00"
+
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        try:
+            slots_resp = requests.get(
+                slots_url,
+                params={
+                    "court_id": f"eq.{court_id}",
+                    "start_at": f"gte.{from_iso}",
+                    "end_at": f"lte.{to_iso}",
+                    "select": "*",
+                    "order": "start_at.asc",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slots_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        rows = slots_resp.json()
+        return JsonResponse(
+            {"results": [_slot_to_range_dict(r) for r in rows]},
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-3106.5.2  GET /api/sports-centers/{id}/schedule?date=DATE
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SportsCenterScheduleView(View):
+    """
+    GET /api/sports-centers/{id}/schedule?date=DATE
+
+    Returns all courts belonging to the sports center plus their slots for the given day.
+    Public endpoint — no auth required.
+
+    Query parameters:
+      date  YYYY-MM-DD  (required)
+
+    Response 200:
+      {
+        "date": "2026-05-25",
+        "courts": [
+          {
+            "id": "...",
+            "name": "Court Alpha",
+            "status": "active",
+            ...
+            "slots": [<slot>, ...]
+          },
+          ...
+        ]
+      }
+
+    Each slot includes booking_id and blocked_reason per grava-3106.5.4.
+    """
+
+    def get(self, request, sc_id):
+        date_raw = request.GET.get("date")
+        if not date_raw:
+            return JsonResponse({"error": "date query parameter is required."}, status=400)
+
+        target_date = _parse_date(date_raw)
+        if target_date is None:
+            return JsonResponse(
+                {"error": f"date \"{date_raw}\" is not a valid YYYY-MM-DD date."}, status=400
+            )
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # --- Fetch all courts for this sports center ---
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        try:
+            courts_resp = requests.get(
+                courts_url,
+                params={
+                    "sports_center_id": f"eq.{sc_id}",
+                    "select": "*",
+                    "order": "name.asc",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if courts_resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        court_rows = courts_resp.json()
+
+        # --- For each court, fetch slots for the given day ---
+        from_iso = f"{target_date.isoformat()}T00:00:00+00:00"
+        next_day = target_date + timedelta(days=1)
+        to_iso = f"{next_day.isoformat()}T00:00:00+00:00"
+
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        courts_with_slots = []
+        for court in court_rows:
+            court_id = court.get("id")
+            try:
+                slots_resp = requests.get(
+                    slots_url,
+                    params={
+                        "court_id": f"eq.{court_id}",
+                        "start_at": f"gte.{from_iso}",
+                        "end_at": f"lte.{to_iso}",
+                        "select": "*",
+                        "order": "start_at.asc",
+                    },
+                    headers=headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+            if slots_resp.status_code != 200:
+                return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+            slot_rows = slots_resp.json()
+            court_data = _court_to_dict(court)
+            court_data["slots"] = [_slot_to_range_dict(s) for s in slot_rows]
+            courts_with_slots.append(court_data)
+
+        return JsonResponse(
+            {"date": target_date.isoformat(), "courts": courts_with_slots},
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-3106.5.3  GET /api/slots/{id}
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotDetailView(View):
+    """
+    GET /api/slots/{id}
+
+    Returns full slot detail including court_name and computed duration_minutes.
+    Public endpoint — no auth required.
+
+    Response 200:
+      {
+        "id": "...",
+        "court_id": "...",
+        "court_name": "Court Alpha",
+        "start_at": "...",
+        "end_at": "...",
+        "duration_minutes": 120,
+        "status": "open" | "booked" | "blocked" | "maintenance",
+        "access_policy": "...",
+        "max_players": ...,
+        "blocked_reason": null | "...",
+        "booking_id": null | "...",
+        "notes": null | "..."
+      }
+
+    grava-3106.5.3 / grava-3106.5.4
+    """
+
+    def get(self, request, slot_id):
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # --- Fetch slot ---
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        try:
+            slot_resp = requests.get(
+                slots_url,
+                params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slot_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        slot_rows = slot_resp.json()
+        if not slot_rows:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        slot = slot_rows[0]
+
+        # --- Fetch related court to get court_name ---
+        court_id = slot.get("court_id")
+        court_name = None
+        if court_id:
+            courts_url = f"{supabase_url}/rest/v1/courts"
+            try:
+                court_resp = requests.get(
+                    courts_url,
+                    params={"id": f"eq.{court_id}", "select": "id,name", "limit": "1"},
+                    headers=headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+            if court_resp.status_code != 200:
+                return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+            court_rows = court_resp.json()
+            if court_rows:
+                court_name = court_rows[0].get("name")
+
+        return JsonResponse(_slot_to_detail_dict(slot, court_name=court_name), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
