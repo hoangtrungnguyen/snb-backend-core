@@ -52,8 +52,13 @@ THIRD_PARTY_APPS = [
 ]
 
 LOCAL_APPS = [
-    # TODO(grava-ea77.4+): add "auth_ext" once the auth_ext app is merged
-    # TODO(grava-ea77.4+): add "courts", "bookings", "series", "notifications", "analytics"
+    "auth_ext",
+    "players",
+    "courts",
+    "bookings",
+    "series",
+    "notifications",
+    "analytics",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -64,7 +69,6 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
-    # TODO(grava-ea77.4+): re-add auth_ext.middleware.JWTAuthMiddleware once auth_ext is merged
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -146,10 +150,8 @@ MEDIA_ROOT = BASE_DIR / "media"
 # ---------------------------------------------------------------------------
 
 REST_FRAMEWORK = {
-    # TODO(grava-ea77.4+): add auth_ext.authentication.SupabaseJWTAuthentication
-    # once the auth_ext app is merged into main.
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.SessionAuthentication",
+        "auth_ext.authentication.SupabaseJWTAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
@@ -157,3 +159,15 @@ REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
 }
+
+# ---------------------------------------------------------------------------
+# Supabase
+# ---------------------------------------------------------------------------
+
+SUPABASE_URL = env.str("SUPABASE_URL", default="")
+SUPABASE_ANON_KEY = env.str("SUPABASE_ANON_KEY", default="")
+SUPABASE_SERVICE_ROLE_KEY = env.str("SUPABASE_SERVICE_ROLE_KEY", default="")
+SUPABASE_JWKS_URL = env.str(
+    "SUPABASE_JWKS_URL",
+    default=f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else "",
+)

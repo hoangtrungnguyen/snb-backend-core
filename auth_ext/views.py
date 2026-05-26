@@ -409,7 +409,7 @@ class PlayerSignupView(View):
             logger.error("Network error reaching Supabase signup endpoint: %s", exc)
             return JsonResponse(
                 {"error": "Authentication service unavailable."},
-                status=503,
+                status=502,
             )
 
         if supabase_resp.status_code == 200:

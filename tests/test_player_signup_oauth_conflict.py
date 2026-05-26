@@ -243,7 +243,7 @@ class PlayerSignupGoogleOAuthConflictTests(TestCase):
     @override_settings(**_TEST_SETTINGS)
     def test_signup_network_error_returns_503(self):
         """
-        Network error reaching Supabase signup endpoint → 503 Service Unavailable.
+        Network error reaching Supabase signup endpoint → 502 Bad Gateway.
         No internal detail is exposed in the body.
         """
         import requests as req_lib
@@ -255,7 +255,7 @@ class PlayerSignupGoogleOAuthConflictTests(TestCase):
                 content_type="application/json",
             )
 
-        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.status_code, 502)
         body = resp.json()
         # No internal error details
         self.assertNotIn("detail", body)
