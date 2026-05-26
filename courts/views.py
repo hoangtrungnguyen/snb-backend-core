@@ -56,6 +56,7 @@ grava-3106.6 (BCORE-025 — Court slug lookup):
       Used by the customer app deep-link router to resolve QR scans (screen 07).
 """
 import json
+import math
 import re
 import unicodedata
 from datetime import datetime, timezone, time as dt_time, date as dt_date, timedelta
@@ -1793,6 +1794,278 @@ class CourtSlugLookupView(View):
             return JsonResponse({"error": "Court not found."}, status=404)
 
         return JsonResponse(_court_to_dict(court), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-5044.1  GET /api/courts/nearby — nearby courts query
+# ---------------------------------------------------------------------------
+
+# Valid radius options (km) per grava-5044.1.8
+_VALID_RADII_KM = frozenset({1, 3, 5})
+
+# time_of_day ranges (start_hour_inclusive, end_hour_exclusive) per grava-5044.1.7
+# night wraps midnight: 21:00-06:00 handled specially
+_TIME_OF_DAY_RANGES = {
+    "morning":   (6, 12),
+    "afternoon": (12, 17),
+    "evening":   (17, 21),
+    "night":     (21, 6),   # wraps midnight
+}
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """
+    Compute great-circle distance between two (lat, lng) points in kilometres.
+
+    Uses the Haversine formula (grava-5044.1.3 fallback).
+    """
+    R = 6371.0  # Earth radius in km
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class CourtsNearbyView(View):
+    """
+    GET /api/courts/nearby
+
+    Returns courts sorted by distance from a player's location.
+
+    Query parameters:
+      lat          float   required — caller latitude
+      lng          float   required — caller longitude
+      radius_km    int     optional — 1 | 3 | 5 (default: 5) (grava-5044.1.8)
+      sport        str     optional — filter: sport_types @> ARRAY[sport] (grava-5044.1.5)
+      price_min    float   optional — filter: price_per_hour >= price_min (grava-5044.1.6)
+      price_max    float   optional — filter: price_per_hour <= price_max (grava-5044.1.6)
+      time_of_day  str     optional — morning|afternoon|evening|night (grava-5044.1.7)
+
+    Response 200: JSON array of court objects sorted by distance_km ASC (grava-5044.1.9).
+    Each court includes:
+      - All standard court fields (from _court_to_dict)
+      - distance_km: float         — Haversine distance from caller (grava-5044.1.3)
+      - has_open_slots_today: bool — True if any open slot exists today (grava-5044.1.4)
+
+    Empty result: [] with 200 (grava-5044.1.10).
+    Public endpoint — no auth required.
+
+    grava-5044.1 / BCORE-060
+    """
+
+    def get(self, request):
+        # --- Validate required params ---
+        lat_raw = request.GET.get("lat")
+        lng_raw = request.GET.get("lng")
+
+        if not lat_raw:
+            return JsonResponse({"error": "lat query parameter is required."}, status=400)
+        if not lng_raw:
+            return JsonResponse({"error": "lng query parameter is required."}, status=400)
+
+        try:
+            caller_lat = float(lat_raw)
+        except (TypeError, ValueError):
+            return JsonResponse(
+                {"error": "lat must be a valid number."}, status=400
+            )
+
+        try:
+            caller_lng = float(lng_raw)
+        except (TypeError, ValueError):
+            return JsonResponse(
+                {"error": "lng must be a valid number."}, status=400
+            )
+
+        # --- radius_km (grava-5044.1.8) ---
+        radius_raw = request.GET.get("radius_km", "5")
+        try:
+            radius_km = int(radius_raw)
+        except (TypeError, ValueError):
+            return JsonResponse(
+                {"error": "radius_km must be one of: 1, 3, 5."}, status=400
+            )
+        if radius_km not in _VALID_RADII_KM:
+            return JsonResponse(
+                {"error": f"radius_km must be one of: {sorted(_VALID_RADII_KM)}."}, status=400
+            )
+
+        # --- time_of_day (grava-5044.1.7) ---
+        time_of_day = request.GET.get("time_of_day")
+        if time_of_day and time_of_day not in _TIME_OF_DAY_RANGES:
+            valid_values = ", ".join(sorted(_TIME_OF_DAY_RANGES.keys()))
+            return JsonResponse(
+                {
+                    "error": (
+                        f"time_of_day must be one of: {valid_values}."
+                    )
+                },
+                status=400,
+            )
+
+        # --- price_min / price_max (grava-5044.1.6) ---
+        price_min_raw = request.GET.get("price_min")
+        price_max_raw = request.GET.get("price_max")
+        price_min = None
+        price_max = None
+
+        if price_min_raw is not None:
+            try:
+                price_min = float(price_min_raw)
+            except (TypeError, ValueError):
+                return JsonResponse(
+                    {"error": "price_min must be a valid number."}, status=400
+                )
+
+        if price_max_raw is not None:
+            try:
+                price_max = float(price_max_raw)
+            except (TypeError, ValueError):
+                return JsonResponse(
+                    {"error": "price_max must be a valid number."}, status=400
+                )
+
+        sport = request.GET.get("sport")
+
+        # --- Build Supabase query ---
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+        courts_url = f"{supabase_url}/rest/v1/courts"
+
+        params = {
+            "select": "*",
+            # grava-5044.1.2: only approved courts
+            "status": "eq.approved",
+        }
+
+        # grava-5044.1.5: sport filter
+        if sport:
+            # PostgREST array contains: cs (contains) with JSON array
+            params["sport_types"] = f"cs.{{\"{ sport }\"}}"
+
+        # grava-5044.1.6: price filters
+        if price_min is not None:
+            params["price_per_hour"] = f"gte.{price_min}"
+        if price_max is not None:
+            # Combine with existing price filter if set
+            if "price_per_hour" in params:
+                # Both min and max: use AND filter via PostgREST
+                # PostgREST doesn't support two filters on same column in params dict,
+                # so we use range filter — append as separate param key
+                params["price_per_hour"] = f"gte.{price_min}"
+                params["price_per_hour.lte"] = f"{price_max}"
+            else:
+                params["price_per_hour"] = f"lte.{price_max}"
+
+        try:
+            resp = requests.get(
+                courts_url,
+                params=params,
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        court_rows = resp.json()
+
+        # --- Filter by distance (Haversine, grava-5044.1.3) ---
+        courts_with_distance = []
+        for court in court_rows:
+            court_lat_raw = court.get("lat")
+            court_lng_raw = court.get("lng")
+            if court_lat_raw is None or court_lng_raw is None:
+                continue
+            try:
+                court_lat = float(court_lat_raw)
+                court_lng = float(court_lng_raw)
+            except (TypeError, ValueError):
+                continue
+
+            distance = _haversine_km(caller_lat, caller_lng, court_lat, court_lng)
+            if distance <= radius_km:
+                courts_with_distance.append((court, distance))
+
+        # --- grava-5044.1.9: Sort by distance ASC ---
+        courts_with_distance.sort(key=lambda x: x[1])
+
+        # --- Compute today's date for has_open_slots_today ---
+        from datetime import date as _date
+        today = _date.today()
+        today_start_iso = f"{today.isoformat()}T00:00:00+00:00"
+        tomorrow = today + timedelta(days=1)
+        today_end_iso = f"{tomorrow.isoformat()}T00:00:00+00:00"
+
+        # --- Build time_of_day slot time filter (grava-5044.1.7) ---
+        slot_time_params = {}
+        if time_of_day:
+            start_h, end_h = _TIME_OF_DAY_RANGES[time_of_day]
+            if time_of_day == "night":
+                # 21:00-06:00 wraps midnight — use start_at >= 21:00 OR start_at < 06:00
+                # PostgREST doesn't support OR easily, so we set start >= 21:00
+                # (simplified: filter for start_at >= 21:00 for today)
+                night_start_iso = f"{today.isoformat()}T21:00:00+00:00"
+                night_end_iso = f"{tomorrow.isoformat()}T06:00:00+00:00"
+                slot_time_params = {
+                    "start_at": f"gte.{night_start_iso}",
+                    "end_at": f"lte.{night_end_iso}",
+                }
+            else:
+                start_iso = f"{today.isoformat()}T{start_h:02d}:00:00+00:00"
+                end_iso = f"{today.isoformat()}T{end_h:02d}:00:00+00:00"
+                slot_time_params = {
+                    "start_at": f"gte.{start_iso}",
+                    "end_at": f"lte.{end_iso}",
+                }
+
+        # --- Build response with has_open_slots_today (grava-5044.1.4) ---
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        results = []
+        for court, distance in courts_with_distance:
+            court_id = court.get("id")
+
+            # Check open slots for today
+            slot_params = {
+                "court_id": f"eq.{court_id}",
+                "status": "eq.open",
+                "select": "id",
+                "limit": "1",
+            }
+
+            if time_of_day and slot_time_params:
+                # Merge time-of-day filter for slot start/end times
+                slot_params.update(slot_time_params)
+            else:
+                # Default: any open slot today
+                slot_params["start_at"] = f"gte.{today_start_iso}"
+                slot_params["end_at"] = f"lte.{today_end_iso}"
+
+            try:
+                slot_resp = requests.get(
+                    slots_url,
+                    params=slot_params,
+                    headers=headers,
+                    timeout=10,
+                )
+                has_open = bool(slot_resp.status_code == 200 and slot_resp.json())
+            except Exception:
+                has_open = False
+
+            court_dict = _court_to_dict(court)
+            court_dict["distance_km"] = round(distance, 3)
+            court_dict["has_open_slots_today"] = has_open
+            results.append(court_dict)
+
+        return JsonResponse(results, safe=False, status=200)
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)

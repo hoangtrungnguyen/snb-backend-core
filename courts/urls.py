@@ -3,6 +3,7 @@ from .views import (
     CourtsListView,
     CourtDetailView,
     CourtSlugLookupView,
+    CourtsNearbyView,
     CourtSettingsView,
     SlotsView,
     SlotBlockView,
@@ -23,6 +24,8 @@ urlpatterns = [
     path("", CourtsListView.as_view(), name="courts-list"),
     # grava-3106.6 — slug lookup must come before the <court_id> catch-all
     path("by-slug/<str:slug>", CourtSlugLookupView.as_view(), name="courts-by-slug"),
+    # grava-5044.1 — nearby courts query (must come before <court_id> catch-all)
+    path("nearby", CourtsNearbyView.as_view(), name="courts-nearby"),
     path("slots", SlotsView.as_view(), name="slots-create"),
     path("slots/<str:slot_id>/block", SlotBlockView.as_view(), name="slots-block"),
     path("slots/<str:slot_id>/unblock", SlotUnblockView.as_view(), name="slots-unblock"),
