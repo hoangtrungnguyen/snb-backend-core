@@ -848,3 +848,219 @@ class SlotsView(View):
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotBlockView(View):
+    """
+    PATCH /api/courts/slots/{id}/block -- block a slot (owner only).
+
+    Sets status=blocked and optionally stores blocked_reason.
+    Returns 409 if the slot is currently booked (cannot block a booked slot).
+
+    grava-3106.3.1
+    """
+
+    def _fetch_slot(self, slot_id: str, supabase_url: str, service_key: str):
+        """Fetch a single slot row by id. Returns dict, None, or 'error'."""
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        try:
+            resp = requests.get(
+                slots_url,
+                params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+                headers=_supabase_headers(service_key),
+                timeout=10,
+            )
+        except _RequestException:
+            return "error"
+        if resp.status_code != 200:
+            return "error"
+        rows = resp.json()
+        if not rows:
+            return None
+        return rows[0]
+
+    def _fetch_court(self, court_id: str, supabase_url: str, service_key: str):
+        """Fetch a single court row by id. Returns dict, None, or 'error'."""
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        try:
+            resp = requests.get(
+                courts_url,
+                params={"id": f"eq.{court_id}", "select": "id,owner_id", "limit": "1"},
+                headers=_supabase_headers(service_key),
+                timeout=10,
+            )
+        except _RequestException:
+            return "error"
+        if resp.status_code != 200:
+            return "error"
+        rows = resp.json()
+        if not rows:
+            return None
+        return rows[0]
+
+    def patch(self, request, slot_id):
+        # --- Auth ---
+        user, err = _require_owner(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+
+        # --- Fetch slot ---
+        slot = self._fetch_slot(slot_id, supabase_url, service_key)
+        if slot == "error":
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+        if slot is None:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        # --- Ownership: fetch the court and verify owner ---
+        court = self._fetch_court(slot["court_id"], supabase_url, service_key)
+        if court == "error":
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+        if court is None or court.get("owner_id") != user.id:
+            return JsonResponse(
+                {"error": "You do not have permission to modify this slot."}, status=403
+            )
+
+        # --- 409 if slot is currently booked ---
+        if slot.get("status") == "booked":
+            return JsonResponse(
+                {"error": "Cannot block a slot that has an active booking."},
+                status=409,
+            )
+
+        # --- Parse optional blocked_reason from body ---
+        blocked_reason = None
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except (json.JSONDecodeError, ValueError):
+            body = {}
+        if isinstance(body, dict):
+            blocked_reason = body.get("blocked_reason")
+
+        # --- Patch slot in Supabase ---
+        update_data = {"status": "blocked", "blocked_reason": blocked_reason}
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        try:
+            patch_resp = requests.patch(
+                slots_url,
+                params={"id": f"eq.{slot_id}", "select": "*"},
+                json=update_data,
+                headers=_supabase_headers(service_key),
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if patch_resp.status_code != 200:
+            return JsonResponse({"error": "Failed to update slot."}, status=503)
+
+        rows = patch_resp.json()
+        if not rows:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        return JsonResponse(_slot_to_dict(rows[0]), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotUnblockView(View):
+    """
+    PATCH /api/courts/slots/{id}/unblock -- unblock a slot (owner only).
+
+    Sets status=open and clears blocked_reason.
+    Slot immediately re-appears in the player slot picker.
+
+    grava-3106.3.2
+    """
+
+    def _fetch_slot(self, slot_id: str, supabase_url: str, service_key: str):
+        """Fetch a single slot row by id. Returns dict, None, or 'error'."""
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        try:
+            resp = requests.get(
+                slots_url,
+                params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+                headers=_supabase_headers(service_key),
+                timeout=10,
+            )
+        except _RequestException:
+            return "error"
+        if resp.status_code != 200:
+            return "error"
+        rows = resp.json()
+        if not rows:
+            return None
+        return rows[0]
+
+    def _fetch_court(self, court_id: str, supabase_url: str, service_key: str):
+        """Fetch a single court row by id. Returns dict, None, or 'error'."""
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        try:
+            resp = requests.get(
+                courts_url,
+                params={"id": f"eq.{court_id}", "select": "id,owner_id", "limit": "1"},
+                headers=_supabase_headers(service_key),
+                timeout=10,
+            )
+        except _RequestException:
+            return "error"
+        if resp.status_code != 200:
+            return "error"
+        rows = resp.json()
+        if not rows:
+            return None
+        return rows[0]
+
+    def patch(self, request, slot_id):
+        # --- Auth ---
+        user, err = _require_owner(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+
+        # --- Fetch slot ---
+        slot = self._fetch_slot(slot_id, supabase_url, service_key)
+        if slot == "error":
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+        if slot is None:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        # --- Ownership: fetch the court and verify owner ---
+        court = self._fetch_court(slot["court_id"], supabase_url, service_key)
+        if court == "error":
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+        if court is None or court.get("owner_id") != user.id:
+            return JsonResponse(
+                {"error": "You do not have permission to modify this slot."}, status=403
+            )
+
+        # --- Patch slot in Supabase: set status=open, clear blocked_reason ---
+        update_data = {"status": "open", "blocked_reason": None}
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        try:
+            patch_resp = requests.patch(
+                slots_url,
+                params={"id": f"eq.{slot_id}", "select": "*"},
+                json=update_data,
+                headers=_supabase_headers(service_key),
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if patch_resp.status_code != 200:
+            return JsonResponse({"error": "Failed to update slot."}, status=503)
+
+        rows = patch_resp.json()
+        if not rows:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        return JsonResponse(_slot_to_dict(rows[0]), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
