@@ -286,6 +286,7 @@ def _court_to_dict(row: dict) -> dict:
         "amenities": row.get("amenities", []),
         "description": row.get("description"),
         "photos": row.get("photos", []),
+        "auto_approve_single": row.get("auto_approve_single", False),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -1770,12 +1771,71 @@ class CourtSlugLookupView(View):
                     "select": "*",
                     "limit": "1",
                 },
+
+
+# grava-3106.7  PATCH /api/courts/{id}/settings — auto-approve toggle
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
+class CourtSettingsView(View):
+    """
+    PATCH /api/courts/{court_id}/settings
+
+    Allows the court owner to update court settings.
+    Currently supports toggling the auto-approve flag for single bookings.
+
+    Request body:
+      {"auto_approve_single": true | false}
+
+    Response 200:
+      {"court_id": "<uuid>", "auto_approve_single": true | false}
+
+    grava-3106.7 / BCORE-026 / OWNER-44
+    """
+
+    def patch(self, request, court_id):
+        # --- Auth + owner role check ---
+        user, err = _require_owner(request)
+        if err is not None:
+            return err
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
+        # --- Validate auto_approve_single ---
+        if "auto_approve_single" not in body:
+            return JsonResponse(
+                {"error": "auto_approve_single is required."}, status=400
+            )
+
+        auto_approve = body["auto_approve_single"]
+        if not isinstance(auto_approve, bool):
+            return JsonResponse(
+                {"error": "auto_approve_single must be a boolean."}, status=400
+            )
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+        courts_url = f"{supabase_url}/rest/v1/courts"
+
+        # --- Fetch court (verify existence + ownership) ---
+        try:
+            court_resp = requests.get(
+                courts_url,
+                params={"id": f"eq.{court_id}", "select": "id,owner_id", "limit": "1"},
                 headers=headers,
                 timeout=10,
             )
         except _RequestException:
             return JsonResponse({"error": "Court service unavailable."}, status=503)
 
+<<<<<<< HEAD
         if resp.status_code != 200:
             return JsonResponse({"error": "Court service unavailable."}, status=503)
 
@@ -1792,6 +1852,48 @@ class CourtSlugLookupView(View):
             return JsonResponse({"error": "Court not found."}, status=404)
 
         return JsonResponse(_court_to_dict(court), status=200)
+=======
+        if court_resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        court_rows = court_resp.json()
+        if not court_rows:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court = court_rows[0]
+        if court.get("owner_id") != user.id:
+            return JsonResponse(
+                {"error": "You do not have permission to modify this court."}, status=403
+            )
+
+        # --- Update auto_approve_single in Supabase ---
+        try:
+            patch_resp = requests.patch(
+                courts_url,
+                params={"id": f"eq.{court_id}", "select": "id,auto_approve_single"},
+                json={"auto_approve_single": auto_approve},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if patch_resp.status_code != 200:
+            return JsonResponse({"error": "Failed to update court settings."}, status=503)
+
+        rows = patch_resp.json()
+        if not rows:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        updated = rows[0]
+        return JsonResponse(
+            {
+                "court_id": updated.get("id"),
+                "auto_approve_single": updated.get("auto_approve_single", False),
+            },
+            status=200,
+        )
+>>>>>>> grava/grava-3106.7
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
