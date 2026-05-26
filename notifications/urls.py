@@ -19,7 +19,7 @@ app_name = "notifications"
 urlpatterns = [
     # POST /api/notifications/read-all must come before /{id}/read
     # to prevent 'read-all' being matched as a notification ID.
-    path("/read-all", NotificationsReadAllView.as_view(), name="notifications-read-all"),
-    path("/<str:notif_id>/read", NotificationsMarkReadView.as_view(), name="notifications-mark-read"),
+    path("read-all", NotificationsReadAllView.as_view(), name="notifications-read-all"),
+    path("<str:notif_id>/read", NotificationsMarkReadView.as_view(), name="notifications-mark-read"),
     path("", NotificationsListView.as_view(), name="notifications-list"),
 ]

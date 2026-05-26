@@ -59,7 +59,9 @@ def health(request):
 
 def _supabase_fetch(path, params=None):
     url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "") or os.environ.get("SUPABASE_ANON_KEY", "")
+    key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+           or os.environ.get("SUPABASE_ANON_KEY", "")
+           or os.environ.get("SUPABASE_KEY", ""))
     if not url or not key:
         return None, "Supabase not configured"
     try:
@@ -77,15 +79,43 @@ def _supabase_fetch(path, params=None):
         return None, str(exc)
 
 
+def _db_fetch(sql, cols):
+    """Query directly via Django DB connection, bypassing REST API / RLS."""
+    try:
+        from django.db import connection
+        with connection.cursor() as cur:
+            cur.execute(sql)
+            rows_data = [dict(zip(cols, row)) for row in cur.fetchall()]
+            total = rows_data[0].get("_count") if rows_data else 0
+        return rows_data, str(total or len(rows_data))
+    except Exception as exc:
+        logger.warning("Dashboard DB fetch failed: %s", exc)
+        return None, "—"
+
+
 @require_http_methods(["GET"])
 def dashboard(request):
-    users, users_count = _supabase_fetch("users", {"select": "id,email,role,created_at", "order": "created_at.desc", "limit": "20"})
-    courts, courts_count = _supabase_fetch("courts", {"select": "id,name,slug,status,sport_type,created_at", "order": "created_at.desc", "limit": "20"})
-    bookings, bookings_count = _supabase_fetch("bookings", {"select": "id,status,created_at", "order": "created_at.desc", "limit": "5"})
+    users, users_count = _db_fetch(
+        "SELECT id, email, role, created_at, COUNT(*) OVER() AS _count "
+        "FROM public.users ORDER BY created_at DESC LIMIT 20",
+        ["id", "email", "role", "created_at", "_count"],
+    )
+    courts, courts_count = _db_fetch(
+        "SELECT id, name, slug, status, sport_types::text AS sport_type, created_at, COUNT(*) OVER() AS _count "
+        "FROM public.courts ORDER BY created_at DESC LIMIT 20",
+        ["id", "name", "slug", "status", "sport_type", "created_at", "_count"],
+    )
+    bookings, bookings_count = _db_fetch(
+        "SELECT id, status, created_at, COUNT(*) OVER() AS _count "
+        "FROM public.bookings ORDER BY created_at DESC LIMIT 5",
+        ["id", "status", "created_at", "_count"],
+    )
 
     def rows(data, cols):
+        if data is None:
+            return "<tr><td colspan='10' style='color:#888;padding:12px'>Unable to load — check database connection</td></tr>"
         if not data:
-            return "<tr><td colspan='10' style='color:#888;padding:12px'>Unable to load — check Supabase connection</td></tr>"
+            return "<tr><td colspan='10' style='color:#aaa;padding:12px;font-style:italic'>No records yet</td></tr>"
         html = ""
         for row in data:
             html += "<tr>" + "".join(f"<td>{row.get(c,'')}</td>" for c in cols) + "</tr>"
@@ -120,7 +150,7 @@ def dashboard(request):
 <header>
   <h1>SportBuddies Admin</h1>
   <span class="badge">local dev</span>
-  <span class="badge" style="margin-left:auto">⚡ {'' if users else '⚠ Supabase unreachable'}</span>
+  <span class="badge" style="margin-left:auto">⚡ {'' if users is not None else '⚠ DB unreachable'}</span>
 </header>
 
 <div class="grid">
