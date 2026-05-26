@@ -1223,3 +1223,162 @@ class BookingStatusView(View):
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# Price estimation service (grava-3432.6 / BCORE-035)
+# ---------------------------------------------------------------------------
+
+
+def _round_to_nearest_30(minutes: float) -> int:
+    """
+    Round a duration in minutes to the nearest 30-minute interval.
+    Ties (e.g. exactly 75 min = midpoint between 60 and 90) round up.
+
+    Examples:
+      60  → 60   (exact multiple)
+      75  → 90   (tie rounds up)
+      110 → 120  (nearest is 120)
+      45  → 60   (tie rounds up)
+    """
+    import math
+    # Round half-up: use floor(x + 0.5) pattern for ties-go-up behaviour.
+    return int(math.floor(minutes / 30 + 0.5) * 30)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PriceEstimateView(View):
+    """
+    GET /api/bookings/price-estimate
+
+    Returns a price estimate for a given court + time window.
+
+    Any authenticated user (player or owner) may call this endpoint.
+    Used by:
+      - OWNER-15 live booking sidebar (owner manual booking form)
+      - CAPP-042 customer wizard Step 1 price breakdown
+
+    For multi-slot "merged" windows (grava-3432.6.4), the client passes the
+    combined start_at/end_at; the backend treats it as a single duration.
+
+    Query parameters:
+      court_id       -- required; UUID of the court
+      start_at       -- required; ISO 8601 datetime (e.g. 2026-06-10T08:00:00+00:00)
+      end_at         -- required; ISO 8601 datetime; must be after start_at
+      price_override -- optional; non-negative number overriding the court's
+                        price_per_hour for this estimate
+
+    Response 200:
+      {
+        "duration_minutes": <int>,        # raw duration rounded to nearest 30
+        "base_price":       <float|null>, # (duration_min/60) * court.price_per_hour
+        "override_price":   <float|null>, # (duration_min/60) * price_override; null if not given
+        "total":            <float|null>  # override_price if provided, else base_price
+      }
+
+    Error responses:
+      400 -- missing/invalid params
+      401 -- missing/invalid token
+      404 -- court not found
+      503 -- upstream unavailable
+    """
+
+    def get(self, request):
+        from datetime import datetime as _dt
+
+        # --- Auth: any authenticated user ---
+        user, err = _require_authenticated(request)
+        if err is not None:
+            return err
+
+        # --- Required params ---
+        court_id = request.GET.get("court_id", "").strip()
+        if not court_id:
+            return JsonResponse({"error": "court_id is required."}, status=400)
+
+        start_at_str = request.GET.get("start_at", "").strip()
+        if not start_at_str:
+            return JsonResponse({"error": "start_at is required."}, status=400)
+
+        end_at_str = request.GET.get("end_at", "").strip()
+        if not end_at_str:
+            return JsonResponse({"error": "end_at is required."}, status=400)
+
+        # --- Parse datetimes ---
+        try:
+            start_at = _dt.fromisoformat(start_at_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return JsonResponse(
+                {"error": "start_at is not a valid ISO 8601 datetime."}, status=400
+            )
+
+        try:
+            end_at = _dt.fromisoformat(end_at_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return JsonResponse(
+                {"error": "end_at is not a valid ISO 8601 datetime."}, status=400
+            )
+
+        if end_at <= start_at:
+            return JsonResponse({"error": "end_at must be after start_at."}, status=400)
+
+        # --- Optional price_override ---
+        price_override = None
+        price_override_str = request.GET.get("price_override", "").strip()
+        if price_override_str:
+            try:
+                price_override = float(price_override_str)
+                if price_override < 0:
+                    raise ValueError("price_override must be non-negative")
+            except (ValueError, TypeError):
+                return JsonResponse(
+                    {"error": "price_override must be a non-negative number."},
+                    status=400,
+                )
+
+        # --- Fetch court ---
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        court = _fetch_one(
+            f"{supabase_url}/rest/v1/courts",
+            params={"id": f"eq.{court_id}", "select": "id,price_per_hour", "limit": "1"},
+            headers=headers,
+        )
+        if court == "error":
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+        if court is None:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        # --- Duration (minutes, rounded to nearest 30) ---
+        raw_minutes = (end_at - start_at).total_seconds() / 60
+        duration_minutes = _round_to_nearest_30(raw_minutes)
+
+        # --- Base price ---
+        court_price_per_hour = court.get("price_per_hour")
+        if court_price_per_hour is not None:
+            base_price = round(float(court_price_per_hour) * duration_minutes / 60, 2)
+        else:
+            base_price = None
+
+        # --- Override price ---
+        if price_override is not None:
+            override_price = round(price_override * duration_minutes / 60, 2)
+        else:
+            override_price = None
+
+        # --- Total ---
+        total = override_price if override_price is not None else base_price
+
+        return JsonResponse(
+            {
+                "duration_minutes": duration_minutes,
+                "base_price": base_price,
+                "override_price": override_price,
+                "total": total,
+            },
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
