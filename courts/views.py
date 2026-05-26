@@ -1771,8 +1771,34 @@ class CourtSlugLookupView(View):
                     "select": "*",
                     "limit": "1",
                 },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        rows = resp.json()
+
+        # grava-3106.6.1 — 404 if slug not found
+        if not rows:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court = rows[0]
+
+        # grava-3106.6.1 — 404 if status is not approved
+        if court.get("status") != "approved":
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        return JsonResponse(_court_to_dict(court), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
 
 
+# ---------------------------------------------------------------------------
 # grava-3106.7  PATCH /api/courts/{id}/settings — auto-approve toggle
 # ---------------------------------------------------------------------------
 
@@ -1835,24 +1861,6 @@ class CourtSettingsView(View):
         except _RequestException:
             return JsonResponse({"error": "Court service unavailable."}, status=503)
 
-<<<<<<< HEAD
-        if resp.status_code != 200:
-            return JsonResponse({"error": "Court service unavailable."}, status=503)
-
-        rows = resp.json()
-
-        # grava-3106.6.1 — 404 if slug not found
-        if not rows:
-            return JsonResponse({"error": "Court not found."}, status=404)
-
-        court = rows[0]
-
-        # grava-3106.6.1 — 404 if status is not approved
-        if court.get("status") != "approved":
-            return JsonResponse({"error": "Court not found."}, status=404)
-
-        return JsonResponse(_court_to_dict(court), status=200)
-=======
         if court_resp.status_code != 200:
             return JsonResponse({"error": "Court service unavailable."}, status=503)
 
@@ -1893,7 +1901,6 @@ class CourtSettingsView(View):
             },
             status=200,
         )
->>>>>>> grava/grava-3106.7
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
