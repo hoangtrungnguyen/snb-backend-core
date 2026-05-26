@@ -1,5 +1,5 @@
 """
-courts.views -- Court CRUD API views.
+courts.views -- Court CRUD and Slot management API views.
 
 Endpoints:
   POST   /api/courts/          -- create court (owner only)
@@ -7,6 +7,7 @@ Endpoints:
   GET    /api/courts/{id}/     -- court detail (public)
   PATCH  /api/courts/{id}/     -- update court (owner only)
   DELETE /api/courts/{id}/     -- soft-delete: sets status=suspended (owner only)
+  POST   /api/courts/slots     -- create slot (owner only) [grava-3106.2]
 
 grava-3106.1 subtasks:
   grava-3106.1.1 -- POST /courts
@@ -17,10 +18,17 @@ grava-3106.1 subtasks:
   grava-3106.1.6 -- PATCH /courts/{id}: owner only, partial
   grava-3106.1.7 -- DELETE /courts/{id}: sets status=suspended; 409 on active bookings
   grava-3106.1.8 -- GET /courts: paginated; filters: owner_id, sport_type, status
+
+grava-3106.2 subtasks:
+  grava-3106.2.1 -- POST /slots: {court_id, start_at, end_at, status}
+  grava-3106.2.2 -- Validates start_at/end_at within court operating_hours
+  grava-3106.2.3 -- No overlapping slot for same court (409 Slot conflict)
+  grava-3106.2.4 -- is_owner_slot: true -> status=blocked, skip payment
 """
 import json
 import re
 import unicodedata
+from datetime import datetime, timezone, time as dt_time
 
 import requests
 from requests import RequestException as _RequestException
@@ -40,6 +48,11 @@ _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _SLUG_NON_ALPHA = re.compile(r"[^a-z0-9]+")
 
 _ACTIVE_BOOKING_STATUSES = ("pending", "confirmed")
+
+# Maps Python weekday() (Mon=0, Sun=6) to operating_hours day keys
+_WEEKDAY_TO_KEY = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+_VALID_SLOT_STATUSES = frozenset(["open", "booked", "blocked", "maintenance"])
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +258,100 @@ def _court_to_dict(row: dict) -> dict:
     }
 
 
+def _slot_to_dict(row: dict) -> dict:
+    """Serialize a Supabase slot row to the API response shape."""
+    return {
+        "id": row.get("id"),
+        "court_id": row.get("court_id"),
+        "start_at": row.get("start_at"),
+        "end_at": row.get("end_at"),
+        "status": row.get("status"),
+        "is_owner_slot": row.get("is_owner_slot", False),
+        "access_policy": row.get("access_policy"),
+        "max_players": row.get("max_players"),
+        "blocked_reason": row.get("blocked_reason"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    """
+    Parse an ISO 8601 datetime string. Returns a timezone-aware datetime or None on failure.
+    Accepts strings ending with 'Z' (UTC) or explicit UTC offsets.
+    """
+    if not isinstance(value, str):
+        return None
+    # Normalize 'Z' suffix to '+00:00' for Python 3.10 compatibility
+    normalized = value.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            # Treat naive datetime as UTC
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, AttributeError):
+        return None
+
+
+def _parse_hhmm(value: str) -> dt_time:
+    """Parse 'HH:MM' string to a time object."""
+    parts = value.split(":")
+    return dt_time(int(parts[0]), int(parts[1]))
+
+
+def _validate_slot_within_operating_hours(
+    start_dt: datetime,
+    end_dt: datetime,
+    operating_hours: dict | None,
+) -> str | None:
+    """
+    Check that *start_dt* and *end_dt* fall within the court's operating_hours.
+
+    operating_hours format: {mon: {open: "HH:MM", close: "HH:MM"}, ...}
+
+    Returns None if valid, or an error string if not.
+    - If operating_hours is None/empty, the court operates 24/7 -> always valid.
+    - Both timestamps must fall on the same day (no overnight slots crossing midnight).
+    - The slot day must have an entry in operating_hours.
+    - start_at.time() >= open AND end_at.time() <= close.
+    """
+    if not operating_hours:
+        return None  # No restriction
+
+    # Determine the weekday key for start_at (in UTC)
+    day_key = _WEEKDAY_TO_KEY[start_dt.weekday()]
+
+    day_hours = operating_hours.get(day_key)
+    if day_hours is None:
+        return (
+            f"Court is closed on {day_key.capitalize()} "
+            f"(no operating hours defined for that day)."
+        )
+
+    open_time = _parse_hhmm(day_hours["open"])
+    close_time = _parse_hhmm(day_hours["close"])
+
+    slot_start_time = start_dt.timetz().replace(tzinfo=None)
+    slot_end_time = end_dt.timetz().replace(tzinfo=None)
+
+    # Remove tz for comparison
+    slot_start_time = dt_time(slot_start_time.hour, slot_start_time.minute)
+    slot_end_time = dt_time(slot_end_time.hour, slot_end_time.minute)
+
+    if slot_start_time < open_time:
+        return (
+            f"start_at ({slot_start_time.strftime('%H:%M')}) is before "
+            f"court opening time ({open_time.strftime('%H:%M')}) on {day_key.capitalize()}."
+        )
+    if slot_end_time > close_time:
+        return (
+            f"end_at ({slot_end_time.strftime('%H:%M')}) is after "
+            f"court closing time ({close_time.strftime('%H:%M')}) on {day_key.capitalize()}."
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------
@@ -418,7 +525,7 @@ class CourtDetailView(View):
         return rows[0]
 
     def get(self, request, court_id):
-        """Public endpoint — no auth required."""
+        """Public endpoint -- no auth required."""
         supabase_url, service_key = _get_supabase_keys()
         court = self._fetch_court(court_id, supabase_url, service_key)
         if court == "error":
@@ -557,6 +664,187 @@ class CourtDetailView(View):
             return JsonResponse({"error": "Court not found."}, status=404)
 
         return JsonResponse(_court_to_dict(rows[0]), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotsView(View):
+    """
+    POST /api/courts/slots -- create a slot (owner only).
+
+    Request body:
+      {
+        "court_id": "<uuid>",
+        "start_at": "<ISO 8601 datetime>",
+        "end_at":   "<ISO 8601 datetime>",
+        "status":   "open" | "booked" | "blocked" | "maintenance",   # optional
+        "is_owner_slot": true | false                                  # optional
+      }
+
+    Validations (grava-3106.2.2, grava-3106.2.3, grava-3106.2.4):
+      - start_at and end_at must fall within court's operating_hours.
+      - No overlapping slot may exist for the same court (409 Slot conflict).
+      - is_owner_slot=true forces status=blocked (payment flow skipped).
+    """
+
+    def post(self, request):
+        # --- Auth ---
+        user, err = _require_owner(request)
+        if err is not None:
+            return err
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
+        # --- Required fields ---
+        court_id = body.get("court_id")
+        if not court_id or not isinstance(court_id, str) or not court_id.strip():
+            return JsonResponse({"error": "court_id is required."}, status=400)
+        court_id = court_id.strip()
+
+        start_at_raw = body.get("start_at")
+        end_at_raw = body.get("end_at")
+
+        if not start_at_raw:
+            return JsonResponse({"error": "start_at is required."}, status=400)
+        if not end_at_raw:
+            return JsonResponse({"error": "end_at is required."}, status=400)
+
+        start_dt = _parse_iso_datetime(start_at_raw)
+        if start_dt is None:
+            return JsonResponse(
+                {"error": "start_at must be a valid ISO 8601 datetime."}, status=400
+            )
+
+        end_dt = _parse_iso_datetime(end_at_raw)
+        if end_dt is None:
+            return JsonResponse(
+                {"error": "end_at must be a valid ISO 8601 datetime."}, status=400
+            )
+
+        if end_dt <= start_dt:
+            return JsonResponse(
+                {"error": "end_at must be after start_at."}, status=400
+            )
+
+        # --- Optional fields ---
+        is_owner_slot = body.get("is_owner_slot", False)
+        if not isinstance(is_owner_slot, bool):
+            return JsonResponse(
+                {"error": "is_owner_slot must be a boolean."}, status=400
+            )
+
+        # grava-3106.2.4: owner slot -> force status=blocked
+        if is_owner_slot:
+            status = "blocked"
+        else:
+            status = body.get("status", "open")
+            if status not in _VALID_SLOT_STATUSES:
+                return JsonResponse(
+                    {
+                        "error": (
+                            f"status must be one of: "
+                            f"{', '.join(sorted(_VALID_SLOT_STATUSES))}."
+                        )
+                    },
+                    status=400,
+                )
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # --- Fetch court (to verify existence and operating_hours) ---
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        try:
+            court_resp = requests.get(
+                courts_url,
+                params={"id": f"eq.{court_id}", "select": "id,owner_id,operating_hours", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if court_resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        court_rows = court_resp.json()
+        if not court_rows:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court = court_rows[0]
+
+        # grava-3106.2.2: validate start_at/end_at within operating_hours
+        operating_hours = court.get("operating_hours")
+        hours_error = _validate_slot_within_operating_hours(start_dt, end_dt, operating_hours)
+        if hours_error:
+            return JsonResponse({"error": hours_error}, status=400)
+
+        # grava-3106.2.3: check for overlapping slots on the same court
+        # Overlap condition: existing.start_at < new.end_at AND existing.end_at > new.start_at
+        slots_url = f"{supabase_url}/rest/v1/slots"
+        start_iso = start_dt.isoformat()
+        end_iso = end_dt.isoformat()
+        try:
+            overlap_resp = requests.get(
+                slots_url,
+                params={
+                    "court_id": f"eq.{court_id}",
+                    "start_at": f"lt.{end_iso}",
+                    "end_at": f"gt.{start_iso}",
+                    "select": "id",
+                    "limit": "1",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if overlap_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if overlap_resp.json():
+            return JsonResponse(
+                {"error": "Slot conflict: an overlapping slot already exists for this court."},
+                status=409,
+            )
+
+        # --- Insert slot ---
+        insert_data = {
+            "court_id": court_id,
+            "start_at": start_iso,
+            "end_at": end_iso,
+            "status": status,
+            "is_owner_slot": is_owner_slot,
+        }
+
+        try:
+            create_resp = requests.post(
+                slots_url,
+                json=insert_data,
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if create_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to create slot."}, status=503)
+
+        rows = create_resp.json()
+        if not rows:
+            return JsonResponse({"error": "Failed to create slot."}, status=503)
+
+        return JsonResponse(_slot_to_dict(rows[0]), status=201)
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
