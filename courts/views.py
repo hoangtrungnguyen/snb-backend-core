@@ -3192,3 +3192,206 @@ class SlotLastMinuteView(View):
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-5044.3  GET /api/slots/open-for-join  (BCORE-062)
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class OpenSlotsForJoinView(View):
+    """
+    GET /api/slots/open-for-join?lat=&lng=&radius_km=&sport=
+
+    Returns open slots near the player sorted by start_at ASC.
+
+    Query parameters:
+      lat        float   required — caller latitude
+      lng        float   required — caller longitude
+      radius_km  int     optional — 1 | 3 | 5 (default: 5)
+      sport      str     optional — filter courts by sport_type
+
+    Filters applied:
+      - slots.access_policy = 'open'
+      - slots.status = 'open'
+      - slots.start_at > now()
+      - court within radius_km of (lat, lng) [Haversine]
+      - If sport given: court.sport_types contains sport
+
+    Response 200:
+      {
+        "results": [
+          {
+            "slot_id":         "<uuid>",
+            "court_id":        "<uuid>",
+            "court_name":      "Court Alpha",
+            "sport":           "football",
+            "start_at":        "<ISO 8601>",
+            "end_at":          "<ISO 8601>",
+            "max_players":     4,
+            "current_players": 2
+          },
+          ...
+        ]
+      }
+
+    Public endpoint — no auth required.
+
+    grava-5044.3 / BCORE-062
+    """
+
+    def get(self, request):
+        # --- Validate lat / lng ---
+        lat_raw = request.GET.get("lat")
+        lng_raw = request.GET.get("lng")
+
+        if not lat_raw:
+            return JsonResponse({"error": "lat query parameter is required."}, status=400)
+        if not lng_raw:
+            return JsonResponse({"error": "lng query parameter is required."}, status=400)
+
+        try:
+            caller_lat = float(lat_raw)
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "lat must be a valid number."}, status=400)
+
+        try:
+            caller_lng = float(lng_raw)
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "lng must be a valid number."}, status=400)
+
+        # --- radius_km (same valid set as CourtsNearbyView) ---
+        radius_raw = request.GET.get("radius_km", "5")
+        try:
+            radius_km = int(radius_raw)
+        except (TypeError, ValueError):
+            return JsonResponse(
+                {"error": "radius_km must be one of: 1, 3, 5."}, status=400
+            )
+        if radius_km not in _VALID_RADII_KM:
+            return JsonResponse(
+                {"error": f"radius_km must be one of: {sorted(_VALID_RADII_KM)}."}, status=400
+            )
+
+        sport = request.GET.get("sport")
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # --- Fetch approved courts ---
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        court_params = {
+            "select": "id,name,sport_types,lat,lng",
+            "status": "eq.approved",
+        }
+        try:
+            courts_resp = requests.get(
+                courts_url, params=court_params, headers=headers, timeout=10
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if courts_resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        all_courts = courts_resp.json()
+
+        # --- Filter courts by distance + optional sport ---
+        courts_in_range = {}  # court_id -> court row
+        for court in all_courts:
+            # Distance filter
+            court_lat_raw = court.get("lat")
+            court_lng_raw = court.get("lng")
+            if court_lat_raw is None or court_lng_raw is None:
+                continue
+            try:
+                court_lat = float(court_lat_raw)
+                court_lng = float(court_lng_raw)
+            except (TypeError, ValueError):
+                continue
+
+            if _haversine_km(caller_lat, caller_lng, court_lat, court_lng) > radius_km:
+                continue
+
+            # Sport filter (post-filter in Python, mirrors CourtsNearbyView pattern)
+            if sport:
+                if sport not in (court.get("sport_types") or []):
+                    continue
+
+            courts_in_range[court["id"]] = court
+
+        if not courts_in_range:
+            return JsonResponse({"results": []}, status=200)
+
+        # --- Fetch open slots for courts in range ---
+        now_iso = datetime.now(timezone.utc).isoformat()
+        slots_url = f"{supabase_url}/rest/v1/slots"
+
+        # Build IN filter for court_ids
+        court_id_list = ",".join(courts_in_range.keys())
+        slot_params = {
+            "court_id": f"in.({court_id_list})",
+            "status": "eq.open",
+            "access_policy": "eq.open",
+            "start_at": f"gt.{now_iso}",
+            "select": "id,court_id,start_at,end_at,max_players",
+            "order": "start_at.asc",
+        }
+
+        try:
+            slots_resp = requests.get(
+                slots_url, params=slot_params, headers=headers, timeout=10
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slots_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        slot_rows = slots_resp.json()
+
+        if not slot_rows:
+            return JsonResponse({"results": []}, status=200)
+
+        # --- Count current_players per slot via slot_participants ---
+        participants_url = f"{supabase_url}/rest/v1/slot_participants"
+        results = []
+        for slot in slot_rows:
+            slot_id = slot.get("id")
+            court = courts_in_range.get(slot.get("court_id"), {})
+            court_name = court.get("name")
+            sport_types = court.get("sport_types") or []
+            first_sport = sport_types[0] if sport_types else None
+
+            # Count participants
+            try:
+                part_resp = requests.get(
+                    participants_url,
+                    params={"slot_id": f"eq.{slot_id}", "select": "id"},
+                    headers=headers,
+                    timeout=10,
+                )
+                current_players = (
+                    len(part_resp.json())
+                    if part_resp.status_code == 200
+                    else 0
+                )
+            except _RequestException:
+                current_players = 0
+
+            results.append({
+                "slot_id": slot_id,
+                "court_id": slot.get("court_id"),
+                "court_name": court_name,
+                "sport": first_sport,
+                "start_at": slot.get("start_at"),
+                "end_at": slot.get("end_at"),
+                "max_players": slot.get("max_players"),
+                "current_players": current_players,
+            })
+
+        return JsonResponse({"results": results}, status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)

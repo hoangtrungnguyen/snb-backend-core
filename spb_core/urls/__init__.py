@@ -16,6 +16,7 @@ from courts.views import (
     SlotParticipantsView,
     SlotJoinStatusView,
     SlotLastMinuteView,
+    OpenSlotsForJoinView,
 )
 
 urlpatterns = [
@@ -36,6 +37,12 @@ urlpatterns = [
         "api/sports-centers/<str:sc_id>/schedule",
         SportsCenterScheduleView.as_view(),
         name="sports-center-schedule",
+    ),
+    # grava-5044.3 — open slot list for join (must come BEFORE the <slot_id> catch-all)
+    path(
+        "api/slots/open-for-join",
+        OpenSlotsForJoinView.as_view(),
+        name="slots-open-for-join",
     ),
     # grava-3106.5.3 — slot detail
     path(
