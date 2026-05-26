@@ -3,6 +3,7 @@ import logging
 import os
 
 import requests
+from django.contrib.admin.views.decorators import staff_member_required
 from django.db import connections
 from django.http import HttpResponse, JsonResponse
 from django.views.decorators.http import require_http_methods
@@ -93,6 +94,7 @@ def _db_fetch(sql, cols):
         return None, "—"
 
 
+@staff_member_required(login_url="/admin/login/")
 @require_http_methods(["GET"])
 def dashboard(request):
     users, users_count = _db_fetch(
