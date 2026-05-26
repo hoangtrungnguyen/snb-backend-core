@@ -6,7 +6,16 @@ from django.contrib import admin
 from django.urls import include, path
 
 from spb_core.views import health
-from courts.views import SportsCenterScheduleView, SlotDetailView
+from courts.views import (
+    SportsCenterScheduleView,
+    SlotDetailView,
+    SlotAccessView,
+    SlotJoinView,
+    SlotJoinRequestApproveView,
+    SlotJoinRequestRejectView,
+    SlotParticipantsView,
+    SlotJoinStatusView,
+)
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -27,5 +36,36 @@ urlpatterns = [
         "api/slots/<str:slot_id>",
         SlotDetailView.as_view(),
         name="slot-detail",
+    ),
+    # grava-3432.5 — Play-together access control
+    path(
+        "api/slots/<str:slot_id>/access",
+        SlotAccessView.as_view(),
+        name="slot-access",
+    ),
+    path(
+        "api/slots/<str:slot_id>/join",
+        SlotJoinView.as_view(),
+        name="slot-join",
+    ),
+    path(
+        "api/slots/<str:slot_id>/participants",
+        SlotParticipantsView.as_view(),
+        name="slot-participants",
+    ),
+    path(
+        "api/slots/<str:slot_id>/join-status",
+        SlotJoinStatusView.as_view(),
+        name="slot-join-status",
+    ),
+    path(
+        "api/slot-join-requests/<str:join_request_id>/approve",
+        SlotJoinRequestApproveView.as_view(),
+        name="slot-join-request-approve",
+    ),
+    path(
+        "api/slot-join-requests/<str:join_request_id>/reject",
+        SlotJoinRequestRejectView.as_view(),
+        name="slot-join-request-reject",
     ),
 ]

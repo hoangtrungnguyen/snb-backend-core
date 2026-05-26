@@ -1799,6 +1799,835 @@ class CourtSlugLookupView(View):
 
 
 # ---------------------------------------------------------------------------
+# grava-3432.5 — Play-together access control helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_authenticated_courts(request):
+    """
+    Return (user, None) for any authenticated user, or (None, JsonResponse).
+
+    Mirrors bookings.views._require_authenticated but lives in courts.views
+    to avoid a cross-app import cycle.
+    """
+    try:
+        result = _authenticate_request(request)
+    except AuthenticationFailed as exc:
+        return None, JsonResponse({"error": str(exc.detail)}, status=401)
+
+    if result is None:
+        return None, JsonResponse(
+            {"error": "Authentication credentials were not provided."}, status=401
+        )
+
+    user, _token = result
+    return user, None
+
+
+def _fetch_booking_for_slot(supabase_url: str, headers: dict, slot_id: str):
+    """
+    Return the confirmed booking row for a slot, or None/error sentinel.
+
+    slot_join_requests / access control uses the *booking owner* as the
+    "slot owner" — the player who made the booking for that slot.
+    """
+    try:
+        resp = requests.get(
+            f"{supabase_url}/rest/v1/bookings",
+            params={"slot_id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+            headers=headers,
+            timeout=10,
+        )
+    except _RequestException:
+        return "error"
+    if resp.status_code != 200:
+        return "error"
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
+# ---------------------------------------------------------------------------
+# grava-3432.5.1  PATCH /api/slots/{id}/access
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotAccessView(View):
+    """
+    PATCH /api/slots/{id}/access
+
+    Booking owner sets access_policy (open|private) and optionally max_players.
+
+    The "slot owner" is the user whose booking is linked to that slot
+    (bookings.slot_id = slot_id).  Only that user may change the access policy.
+
+    Request body (JSON):
+      {
+        "access_policy": "open" | "private",   # required
+        "max_players":   <int> | null           # optional
+      }
+
+    Responses:
+      200 — updated slot object (id, access_policy, max_players, ...)
+      400 — missing/invalid fields or invalid JSON
+      401 — no/invalid token
+      403 — caller is not the booking owner for this slot
+      404 — slot not found, or no booking found for slot
+      503 — upstream error
+
+    grava-3432.5.1 / BCORE-137 / CAPP-046
+    """
+
+    _VALID_POLICIES = frozenset({"open", "private"})
+
+    def patch(self, request, slot_id: str):
+        user, err = _require_authenticated_courts(request)
+        if err is not None:
+            return err
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
+        access_policy = body.get("access_policy")
+        if not access_policy or not isinstance(access_policy, str):
+            return JsonResponse({"error": "access_policy is required."}, status=400)
+
+        access_policy = access_policy.strip()
+        if access_policy not in self._VALID_POLICIES:
+            return JsonResponse(
+                {"error": f"access_policy must be one of: {', '.join(sorted(self._VALID_POLICIES))}."},
+                status=400,
+            )
+
+        max_players = body.get("max_players")
+        if max_players is not None:
+            try:
+                max_players = int(max_players)
+                if max_players < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return JsonResponse(
+                    {"error": "max_players must be a positive integer."},
+                    status=400,
+                )
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # Fetch slot
+        try:
+            slot_resp = requests.get(
+                f"{supabase_url}/rest/v1/slots",
+                params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slot_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        slot_rows = slot_resp.json()
+        if not slot_rows:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        # Fetch booking to determine slot owner
+        booking = _fetch_booking_for_slot(supabase_url, headers, slot_id)
+        if booking == "error":
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+        if booking is None:
+            return JsonResponse({"error": "No booking found for this slot."}, status=404)
+
+        if booking.get("user_id") != user.id:
+            return JsonResponse(
+                {"error": "Only the booking owner may change this slot's access policy."},
+                status=403,
+            )
+
+        # Apply update
+        update_data: dict = {"access_policy": access_policy}
+        if max_players is not None:
+            update_data["max_players"] = max_players
+
+        try:
+            patch_resp = requests.patch(
+                f"{supabase_url}/rest/v1/slots",
+                params={"id": f"eq.{slot_id}", "select": "*"},
+                json=update_data,
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if patch_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to update slot."}, status=503)
+
+        updated_rows = patch_resp.json()
+        if not updated_rows:
+            return JsonResponse({"error": "Failed to update slot."}, status=503)
+
+        updated_slot = updated_rows[0]
+        return JsonResponse(
+            {
+                "id": updated_slot.get("id"),
+                "court_id": updated_slot.get("court_id"),
+                "access_policy": updated_slot.get("access_policy"),
+                "max_players": updated_slot.get("max_players"),
+                "status": updated_slot.get("status"),
+                "start_at": updated_slot.get("start_at"),
+                "end_at": updated_slot.get("end_at"),
+            },
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-3432.5.2  POST /api/slots/{id}/join
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotJoinView(View):
+    """
+    POST /api/slots/{id}/join
+
+    Player requests to join an open slot.  Creates a slot_join_requests row
+    with status=pending.
+
+    Rules:
+      - Slot must exist.
+      - Slot access_policy must be "open" → 409 if "private".
+      - Player must not already have a pending/approved request → 409.
+
+    Response 201: join request object {id, slot_id, user_id, status, requested_at}
+    Error responses:
+      401 — no/invalid token
+      404 — slot not found
+      409 — slot is private, or player already has a request
+      503 — upstream error
+
+    grava-3432.5.2 / BCORE-138 / CAPP-054
+    """
+
+    def post(self, request, slot_id: str):
+        user, err = _require_authenticated_courts(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # Fetch slot
+        try:
+            slot_resp = requests.get(
+                f"{supabase_url}/rest/v1/slots",
+                params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slot_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        slot_rows = slot_resp.json()
+        if not slot_rows:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        slot = slot_rows[0]
+
+        if slot.get("access_policy") == "private":
+            return JsonResponse(
+                {"error": "This slot is private and not open for join requests."},
+                status=409,
+            )
+
+        # Check for existing pending/approved request
+        try:
+            existing_resp = requests.get(
+                f"{supabase_url}/rest/v1/slot_join_requests",
+                params={
+                    "slot_id": f"eq.{slot_id}",
+                    "user_id": f"eq.{user.id}",
+                    "status": "in.(pending,approved)",
+                    "select": "id,status",
+                    "limit": "1",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if existing_resp.status_code == 200 and existing_resp.json():
+            return JsonResponse(
+                {"error": "You already have an active join request for this slot."},
+                status=409,
+            )
+
+        # Create join request
+        try:
+            create_resp = requests.post(
+                f"{supabase_url}/rest/v1/slot_join_requests",
+                json={
+                    "slot_id": slot_id,
+                    "user_id": user.id,
+                    "status": "pending",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if create_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to create join request."}, status=503)
+
+        created_rows = create_resp.json()
+        if not created_rows:
+            return JsonResponse({"error": "Failed to create join request."}, status=503)
+
+        row = created_rows[0]
+        return JsonResponse(
+            {
+                "id": row.get("id"),
+                "slot_id": row.get("slot_id"),
+                "user_id": row.get("user_id"),
+                "status": row.get("status"),
+                "requested_at": row.get("requested_at"),
+            },
+            status=201,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-3432.5.3/4  PATCH /api/slot-join-requests/{id}/approve|reject
+# ---------------------------------------------------------------------------
+
+
+def _resolve_join_request_owner(
+    supabase_url: str,
+    headers: dict,
+    join_request_id: str,
+    user_id: str,
+):
+    """
+    Validate that `user_id` is the booking owner for the slot referenced by
+    the join request.
+
+    Returns:
+      (join_request_row, None)   — authorised
+      (None, JsonResponse)       — error / not authorised
+    """
+    # Fetch join request
+    try:
+        jr_resp = requests.get(
+            f"{supabase_url}/rest/v1/slot_join_requests",
+            params={"id": f"eq.{join_request_id}", "select": "*", "limit": "1"},
+            headers=headers,
+            timeout=10,
+        )
+    except _RequestException:
+        return None, JsonResponse({"error": "Service unavailable."}, status=503)
+
+    if jr_resp.status_code != 200:
+        return None, JsonResponse({"error": "Service unavailable."}, status=503)
+
+    jr_rows = jr_resp.json()
+    if not jr_rows:
+        return None, JsonResponse({"error": "Join request not found."}, status=404)
+
+    join_request = jr_rows[0]
+
+    # Fetch slot
+    slot_id = join_request.get("slot_id")
+    try:
+        slot_resp = requests.get(
+            f"{supabase_url}/rest/v1/slots",
+            params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+            headers=headers,
+            timeout=10,
+        )
+    except _RequestException:
+        return None, JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+    if slot_resp.status_code != 200:
+        return None, JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+    slot_rows = slot_resp.json()
+    if not slot_rows:
+        return None, JsonResponse({"error": "Slot not found."}, status=404)
+
+    # Fetch booking to verify slot owner
+    booking = _fetch_booking_for_slot(supabase_url, headers, slot_id)
+    if booking == "error":
+        return None, JsonResponse({"error": "Booking service unavailable."}, status=503)
+    if booking is None:
+        return None, JsonResponse({"error": "No booking found for this slot."}, status=404)
+
+    if booking.get("user_id") != user_id:
+        return None, JsonResponse(
+            {"error": "Only the booking owner of this slot may manage join requests."},
+            status=403,
+        )
+
+    return join_request, None
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotJoinRequestApproveView(View):
+    """
+    PATCH /api/slot-join-requests/{id}/approve
+
+    Slot booking owner approves a pending join request.
+    - Sets request status = approved.
+    - Inserts a slot_participants row.
+    - Sends notification to the requester: "Yêu cầu tham gia đã được chấp nhận".
+
+    Responses:
+      200 — updated join request {id, slot_id, user_id, status, requested_at}
+      401 — no/invalid token
+      403 — not the slot booking owner
+      404 — join request or slot not found
+      409 — request already processed (not pending)
+      503 — upstream error
+
+    grava-3432.5.3 / BCORE-139 / CAPP-053
+    """
+
+    def patch(self, request, join_request_id: str):
+        user, err = _require_authenticated_courts(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        join_request, err = _resolve_join_request_owner(
+            supabase_url, headers, join_request_id, user.id
+        )
+        if err is not None:
+            return err
+
+        # Guard: must be pending
+        if join_request.get("status") != "pending":
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Cannot approve a join request with status "
+                        f"'{join_request['status']}'."
+                    )
+                },
+                status=409,
+            )
+
+        # Update join request status
+        try:
+            patch_resp = requests.patch(
+                f"{supabase_url}/rest/v1/slot_join_requests",
+                params={"id": f"eq.{join_request_id}", "select": "*"},
+                json={"status": "approved"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if patch_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to update join request."}, status=503)
+
+        updated_rows = patch_resp.json()
+        if not updated_rows:
+            return JsonResponse({"error": "Failed to update join request."}, status=503)
+
+        updated_jr = updated_rows[0]
+        requester_id: str = join_request.get("user_id", "")
+        slot_id: str = join_request.get("slot_id", "")
+
+        # Insert slot_participants row (best-effort; fires-and-forgets on error)
+        try:
+            requests.post(
+                f"{supabase_url}/rest/v1/slot_participants",
+                json={
+                    "slot_id": slot_id,
+                    "user_id": requester_id,
+                    "payment_status": "unpaid",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+        # Fire-and-forget notification to requester
+        try:
+            requests.post(
+                f"{supabase_url}/rest/v1/notifications",
+                json={
+                    "user_id": requester_id,
+                    "title": "Yêu cầu tham gia đã được chấp nhận",
+                    "body": "Yêu cầu tham gia đã được chấp nhận",
+                    "read": False,
+                    "related_slot_id": slot_id,
+                },
+                headers=headers,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+        return JsonResponse(
+            {
+                "id": updated_jr.get("id"),
+                "slot_id": updated_jr.get("slot_id"),
+                "user_id": updated_jr.get("user_id"),
+                "status": updated_jr.get("status"),
+                "requested_at": updated_jr.get("requested_at"),
+            },
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotJoinRequestRejectView(View):
+    """
+    PATCH /api/slot-join-requests/{id}/reject
+
+    Slot booking owner rejects a pending join request.
+    - Sets request status = rejected.
+    - Sends notification to the requester.
+
+    Responses:
+      200 — updated join request
+      401 — no/invalid token
+      403 — not the slot booking owner
+      404 — join request or slot not found
+      409 — request already processed (not pending)
+      503 — upstream error
+
+    grava-3432.5.4 / BCORE-140
+    """
+
+    def patch(self, request, join_request_id: str):
+        user, err = _require_authenticated_courts(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        join_request, err = _resolve_join_request_owner(
+            supabase_url, headers, join_request_id, user.id
+        )
+        if err is not None:
+            return err
+
+        # Guard: must be pending
+        if join_request.get("status") != "pending":
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Cannot reject a join request with status "
+                        f"'{join_request['status']}'."
+                    )
+                },
+                status=409,
+            )
+
+        # Update join request status
+        try:
+            patch_resp = requests.patch(
+                f"{supabase_url}/rest/v1/slot_join_requests",
+                params={"id": f"eq.{join_request_id}", "select": "*"},
+                json={"status": "rejected"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if patch_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to update join request."}, status=503)
+
+        updated_rows = patch_resp.json()
+        if not updated_rows:
+            return JsonResponse({"error": "Failed to update join request."}, status=503)
+
+        updated_jr = updated_rows[0]
+        requester_id: str = join_request.get("user_id", "")
+        slot_id: str = join_request.get("slot_id", "")
+
+        # Fire-and-forget notification to requester
+        try:
+            requests.post(
+                f"{supabase_url}/rest/v1/notifications",
+                json={
+                    "user_id": requester_id,
+                    "title": "Yêu cầu tham gia bị từ chối",
+                    "body": "Yêu cầu tham gia bị từ chối",
+                    "read": False,
+                    "related_slot_id": slot_id,
+                },
+                headers=headers,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+        return JsonResponse(
+            {
+                "id": updated_jr.get("id"),
+                "slot_id": updated_jr.get("slot_id"),
+                "user_id": updated_jr.get("user_id"),
+                "status": updated_jr.get("status"),
+                "requested_at": updated_jr.get("requested_at"),
+            },
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-3432.5.5  GET /api/slots/{id}/participants
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotParticipantsView(View):
+    """
+    GET /api/slots/{id}/participants
+
+    Returns:
+      - participants: confirmed slot_participants rows for this slot.
+      - join_requests: pending slot_join_requests rows.
+
+    Access:
+      - Any authenticated user may call this endpoint.
+      - The booking owner sees both lists in full.
+      - Other authenticated users see both lists (read-only transparency).
+
+    Response 200:
+      {
+        "slot_id": "<uuid>",
+        "participants": [ {id, slot_id, user_id, joined_at, payment_status, payment_method}, ... ],
+        "join_requests": [ {id, slot_id, user_id, status, requested_at}, ... ]
+      }
+
+    Error responses:
+      401 — no/invalid token
+      404 — slot not found
+      503 — upstream error
+
+    grava-3432.5.5 / BCORE-141
+    """
+
+    def get(self, request, slot_id: str):
+        user, err = _require_authenticated_courts(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # Verify slot exists
+        try:
+            slot_resp = requests.get(
+                f"{supabase_url}/rest/v1/slots",
+                params={"id": f"eq.{slot_id}", "select": "id", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slot_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if not slot_resp.json():
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        # Fetch booking for slot (used only for future owner-only gating; no gating here)
+        _fetch_booking_for_slot(supabase_url, headers, slot_id)
+
+        # Fetch slot_participants
+        try:
+            part_resp = requests.get(
+                f"{supabase_url}/rest/v1/slot_participants",
+                params={"slot_id": f"eq.{slot_id}", "select": "*"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if part_resp.status_code != 200:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        participants = [
+            {
+                "id": r.get("id"),
+                "slot_id": r.get("slot_id"),
+                "user_id": r.get("user_id"),
+                "joined_at": r.get("joined_at"),
+                "payment_status": r.get("payment_status"),
+                "payment_method": r.get("payment_method"),
+            }
+            for r in part_resp.json()
+        ]
+
+        # Fetch pending join requests
+        try:
+            jr_resp = requests.get(
+                f"{supabase_url}/rest/v1/slot_join_requests",
+                params={
+                    "slot_id": f"eq.{slot_id}",
+                    "status": "eq.pending",
+                    "select": "*",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if jr_resp.status_code != 200:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        join_requests = [
+            {
+                "id": r.get("id"),
+                "slot_id": r.get("slot_id"),
+                "user_id": r.get("user_id"),
+                "status": r.get("status"),
+                "requested_at": r.get("requested_at"),
+            }
+            for r in jr_resp.json()
+        ]
+
+        return JsonResponse(
+            {
+                "slot_id": slot_id,
+                "participants": participants,
+                "join_requests": join_requests,
+            },
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# grava-3432.5.6  GET /api/slots/{id}/join-status
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SlotJoinStatusView(View):
+    """
+    GET /api/slots/{id}/join-status?user_id=<uuid>
+
+    Returns the current requester's join status for the slot.
+
+    Query params:
+      user_id — UUID of the player to check (optional; defaults to authenticated user)
+
+    Response 200:
+      {"slot_id": "<uuid>", "user_id": "<uuid>", "status": "pending"|"approved"|"rejected"|"none"}
+
+    Error responses:
+      401 — no/invalid token
+      404 — slot not found
+      503 — upstream error
+
+    grava-3432.5.6 / BCORE-142 / CAPP-054
+    """
+
+    def get(self, request, slot_id: str):
+        user, err = _require_authenticated_courts(request)
+        if err is not None:
+            return err
+
+        # user_id param defaults to the authenticated caller
+        target_user_id = request.GET.get("user_id") or user.id
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # Verify slot exists
+        try:
+            slot_resp = requests.get(
+                f"{supabase_url}/rest/v1/slots",
+                params={"id": f"eq.{slot_id}", "select": "id", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slot_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if not slot_resp.json():
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        # Fetch most recent join request for this user+slot
+        try:
+            jr_resp = requests.get(
+                f"{supabase_url}/rest/v1/slot_join_requests",
+                params={
+                    "slot_id": f"eq.{slot_id}",
+                    "user_id": f"eq.{target_user_id}",
+                    "select": "id,status",
+                    "order": "requested_at.desc",
+                    "limit": "1",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if jr_resp.status_code != 200:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        jr_rows = jr_resp.json()
+        join_status = jr_rows[0]["status"] if jr_rows else "none"
+
+        return JsonResponse(
+            {
+                "slot_id": slot_id,
+                "user_id": target_user_id,
+                "status": join_status,
+            },
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
 # grava-3106.7  PATCH /api/courts/{id}/settings — auto-approve toggle
 # ---------------------------------------------------------------------------
 

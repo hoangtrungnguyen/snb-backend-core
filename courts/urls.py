@@ -9,6 +9,12 @@ from .views import (
     SlotUnblockView,
     RecurrenceView,
     CourtSlotsRangeView,
+    SlotAccessView,
+    SlotJoinView,
+    SlotJoinRequestApproveView,
+    SlotJoinRequestRejectView,
+    SlotParticipantsView,
+    SlotJoinStatusView,
 )
 
 app_name = "courts"
