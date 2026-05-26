@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 
 import requests
-from django.conf import settings
 from jose import ExpiredSignatureError, JWTError, jwt
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
@@ -141,31 +140,14 @@ class SupabaseJWTAuthentication(BaseAuthentication):
         return payload
 
     def _fetch_user_from_db(self, uid: str) -> dict | None:
-        """
-        Fetch the user row from the Supabase REST API (``users`` table).
-
-        Returns the first matching row as a dict, or ``None`` if not found.
-
-        Raises
-        ------
-        requests.RequestException
-            On network failure (caller may choose to surface as 503).
-        """
-        supabase_url = getattr(settings, "SUPABASE_URL", "")
-        supabase_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-
-        rest_url = f"{supabase_url}/rest/v1/users"
-        resp = requests.get(
-            rest_url,
-            params={"id": f"eq.{uid}", "select": "id,role,email"},
-            headers={
-                "apikey": supabase_key,
-                "Authorization": f"Bearer {supabase_key}",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        rows = resp.json()
-        if not rows:
+        """Fetch user row from the database directly (no REST API required)."""
+        from django.db import connection
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT id, role, email FROM public.users WHERE id = %s LIMIT 1",
+                [uid],
+            )
+            row = cur.fetchone()
+        if row is None:
             return None
-        return rows[0]
+        return {"id": str(row[0]), "role": row[1], "email": row[2]}

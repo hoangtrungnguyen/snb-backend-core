@@ -177,10 +177,7 @@ REST_FRAMEWORK = {
 # ---------------------------------------------------------------------------
 
 SUPABASE_URL = env.str("SUPABASE_URL", default="")
-# Accept SUPABASE_KEY (publishable) or SUPABASE_ANON_KEY interchangeably
 SUPABASE_ANON_KEY = env.str("SUPABASE_ANON_KEY", default="") or env.str("SUPABASE_KEY", default="")
 SUPABASE_SERVICE_ROLE_KEY = env.str("SUPABASE_SERVICE_ROLE_KEY", default="") or SUPABASE_ANON_KEY
-SUPABASE_JWKS_URL = env.str(
-    "SUPABASE_JWKS_URL",
-    default=f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else "",
-)
+_default_jwks = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else ""
+SUPABASE_JWKS_URL = env.str("SUPABASE_JWKS_URL", default=_default_jwks)

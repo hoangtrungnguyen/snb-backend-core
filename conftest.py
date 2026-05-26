@@ -14,14 +14,16 @@ def pytest_configure(config):
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "spb_core.settings.local")
     os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest")
 
-    # Fall back to dummy values only when .env is absent (CI without secrets)
-    supabase_url = os.environ.get("SUPABASE_URL", "https://test.supabase.co")
-    supabase_key = os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_ANON_KEY", "test-anon-key")
-    os.environ.setdefault("SUPABASE_URL", supabase_url)
-    os.environ.setdefault("SUPABASE_ANON_KEY", supabase_key)
-    os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", supabase_key)
-    os.environ.setdefault(
-        "SUPABASE_JWKS_URL",
-        f"{supabase_url}/auth/v1/.well-known/jwks.json",
-    )
+    # SUPABASE_URL / SUPABASE_KEY are optional — only set fallbacks for CI
+    # where .env is absent. When .env omits them, leave them empty so the app
+    # uses direct DB auth only.
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    supabase_key = os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_ANON_KEY", "")
+    if supabase_url:
+        os.environ.setdefault("SUPABASE_ANON_KEY", supabase_key)
+        os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", supabase_key)
+        os.environ.setdefault(
+            "SUPABASE_JWKS_URL",
+            f"{supabase_url}/auth/v1/.well-known/jwks.json",
+        )
     django.setup()
