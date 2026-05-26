@@ -459,3 +459,120 @@ class PlayersMeAvatarView(View):
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PlayersMeLocationView(View):
+    """
+    PATCH /api/players/me/location — update player's current location.
+
+    Body: {"lat": float, "lng": float}
+
+    Updates users.last_lat and users.last_lng (no history stored).
+    Called by the client app when the map screen opens.
+
+    Responses:
+      200 — {"last_lat": ..., "last_lng": ...}
+      400 — missing/invalid lat or lng
+      401 — no/invalid token
+      403 — non-player role
+      404 — user not found
+      503 — upstream error
+
+    grava-5044.4 / BCORE-063
+    """
+
+    def _authenticate_player(self, request):
+        """Authenticate + authorise as player. Returns (user, None) or (None, error_response)."""
+        try:
+            auth_result = _authenticate_request(request)
+        except AuthenticationFailed as exc:
+            return None, JsonResponse({"error": str(exc.detail)}, status=401)
+
+        if auth_result is None:
+            return None, JsonResponse(
+                {"error": "Authentication credentials were not provided."}, status=401
+            )
+
+        user, _token = auth_result
+
+        if user.role != "player":
+            return None, JsonResponse(
+                {"error": "You do not have permission to perform this action."}, status=403
+            )
+
+        return user, None
+
+    def patch(self, request):
+        user, err_response = self._authenticate_player(request)
+        if err_response is not None:
+            return err_response
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
+        # --- Validate lat ---
+        lat_raw = body.get("lat")
+        if lat_raw is None:
+            return JsonResponse({"error": "lat is required."}, status=400)
+        try:
+            lat = float(lat_raw)
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "lat must be a valid number."}, status=400)
+        if not (-90.0 <= lat <= 90.0):
+            return JsonResponse({"error": "lat must be between -90 and 90."}, status=400)
+
+        # --- Validate lng ---
+        lng_raw = body.get("lng")
+        if lng_raw is None:
+            return JsonResponse({"error": "lng is required."}, status=400)
+        try:
+            lng = float(lng_raw)
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "lng must be a valid number."}, status=400)
+        if not (-180.0 <= lng <= 180.0):
+            return JsonResponse({"error": "lng must be between -180 and 180."}, status=400)
+
+        # --- Update last_lat / last_lng in Supabase ---
+        # grava-5044.4.3: no history stored — only current location is updated
+        supabase_url, service_role_key = _get_supabase_keys()
+        users_endpoint = f"{supabase_url}/rest/v1/users"
+
+        try:
+            resp = requests.patch(
+                users_endpoint,
+                params={
+                    "id": f"eq.{user.id}",
+                    "select": "id,last_lat,last_lng",
+                },
+                json={"last_lat": lat, "last_lng": lng},
+                headers=_supabase_headers(service_role_key),
+                timeout=10,
+            )
+        except requests.RequestException:
+            return JsonResponse({"error": "Player profile service unavailable."}, status=503)
+
+        if resp.status_code != 200:
+            return JsonResponse({"error": "Player profile service unavailable."}, status=503)
+
+        data = resp.json()
+        if not data:
+            return JsonResponse({"error": "Player profile not found."}, status=404)
+
+        profile = data[0]
+        return JsonResponse(
+            {
+                "last_lat": profile.get("last_lat"),
+                "last_lng": profile.get("last_lng"),
+            },
+            status=200,
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
