@@ -448,47 +448,71 @@ class BookingCreateView(View):
 
 
 # ---------------------------------------------------------------------------
-# Walk-in booking view (grava-3432.2 / BCORE-031)
+# Manual / walk-in booking view (grava-3432.2 / BCORE-031)
 # ---------------------------------------------------------------------------
+
+import re as _re
+
+_E164_RE = _re.compile(r"^\+[1-9]\d{6,14}$")
+
+_DATE_RE_MANUAL = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIME_RE_MANUAL = _re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _validate_e164(phone: str) -> bool:
+    """Return True if phone matches E.164 format (+<country><number>, 7–15 digits total)."""
+    return bool(_E164_RE.match(phone))
 
 
 @method_decorator(csrf_exempt, name="dispatch")
-class WalkInBookingView(View):
+class ManualBookingView(View):
     """
-    POST /api/bookings/walk-in
+    POST /api/bookings/manual
 
-    Owner creates a manual / walk-in booking for a slot they own.
-    The customer is present in-person; no player JWT needed.
+    Owner creates a manual / walk-in booking for an in-person customer.
+    Unlike the player-facing booking flow, there is no player JWT; the owner
+    provides the customer details and selects the court + time window directly.
 
     Acceptance criteria (grava-3432.2 / BCORE-031):
       1. Owner-only: role must be "owner" (403 otherwise).
-      2. Owner must own the court linked to the slot (403 otherwise).
-      3. slot.status must be "open" (409 if not).
+      2. Owner must own the court (403 otherwise).
+      3. Auto-create slot: if no slot exists for the given court/window, create one.
+         If a slot exists for that window but status != "open" → 409
+         ("Giờ này đã có slot").
       4. Booking inserted with:
            is_walk_in=True, status="confirmed", is_auto_approved=True
            user_id = owner's UID
-      5. slots.status updated to "booked".
-      6. Owner receives confirmation notification: "Đặt sân thủ công thành công".
+      5. price_per_hour: use price_per_hour_override if provided, else court default.
+         Compute duration_minutes and total_price.
+      6. slots.status updated to "booked".
+      7. Owner receives confirmation notification: "Đặt sân thủ công thành công".
+      8. customer_phone validated as E.164 if provided.
 
     Request body (JSON):
       {
-        "slot_id":        "<uuid>",   # required
-        "customer_name":  "<str>",    # optional
-        "customer_phone": "<str>",    # optional
-        "notes":          "<str>"     # optional
+        "court_id":               "<uuid>",         # required
+        "date":                   "YYYY-MM-DD",     # required
+        "start_time":             "HH:MM",          # required
+        "end_time":               "HH:MM",          # required (must be > start_time)
+        "customer_name":          "<str>",           # optional
+        "customer_phone":         "<str>",           # optional; E.164 if provided
+        "notes":                  "<str>",           # optional
+        "price_per_hour_override": <number>         # optional; overrides court default
       }
 
     Response 201: booking object (includes is_walk_in=True)
     Error responses:
-      400 — missing slot_id or invalid JSON
+      400 — missing/invalid fields or invalid JSON
       401 — missing / invalid token
       403 — not an owner, or does not own the court
-      404 — slot not found
-      409 — slot not open
+      404 — court not found
+      409 — slot window already occupied
       503 — upstream service unavailable
     """
 
     def post(self, request):
+        from datetime import datetime, timezone as dt_tz, timedelta
+
         # --- Auth: owner only ---
         user, err = _require_owner(request)
         if err is not None:
@@ -503,51 +527,76 @@ class WalkInBookingView(View):
         if not isinstance(body, dict):
             return JsonResponse({"error": "Invalid request body."}, status=400)
 
-        # --- Validate required field: slot_id ---
-        slot_id = body.get("slot_id")
-        if not slot_id or not isinstance(slot_id, str) or not slot_id.strip():
-            return JsonResponse({"error": "slot_id is required."}, status=400)
-        slot_id = slot_id.strip()
+        # --- Validate required fields ---
+        court_id = body.get("court_id")
+        if not court_id or not isinstance(court_id, str) or not court_id.strip():
+            return JsonResponse({"error": "court_id is required."}, status=400)
+        court_id = court_id.strip()
 
-        customer_name = body.get("customer_name") or ""
-        customer_phone = body.get("customer_phone") or ""
-        notes = body.get("notes") or ""
+        date_str = body.get("date")
+        if not date_str or not isinstance(date_str, str) or not _DATE_RE_MANUAL.match(date_str.strip()):
+            return JsonResponse({"error": "date is required (YYYY-MM-DD)."}, status=400)
+        date_str = date_str.strip()
+
+        start_time_str = body.get("start_time")
+        if not start_time_str or not isinstance(start_time_str, str) or not _TIME_RE_MANUAL.match(start_time_str.strip()):
+            return JsonResponse({"error": "start_time is required (HH:MM)."}, status=400)
+        start_time_str = start_time_str.strip()
+
+        end_time_str = body.get("end_time")
+        if not end_time_str or not isinstance(end_time_str, str) or not _TIME_RE_MANUAL.match(end_time_str.strip()):
+            return JsonResponse({"error": "end_time is required (HH:MM)."}, status=400)
+        end_time_str = end_time_str.strip()
+
+        # --- Build ISO timestamps (treat as UTC) ---
+        try:
+            start_at = datetime.fromisoformat(f"{date_str}T{start_time_str}:00+00:00")
+            end_at = datetime.fromisoformat(f"{date_str}T{end_time_str}:00+00:00")
+        except ValueError:
+            return JsonResponse({"error": "Invalid date or time value."}, status=400)
+
+        if end_at <= start_at:
+            return JsonResponse({"error": "end_time must be after start_time."}, status=400)
+
+        # --- Optional fields ---
+        customer_name: str = body.get("customer_name") or ""
+        customer_phone: str = (body.get("customer_phone") or "").strip()
+        notes: str = body.get("notes") or ""
+        price_override = body.get("price_per_hour_override")
+
+        # --- Validate phone (E.164) ---
+        if customer_phone and not _validate_e164(customer_phone):
+            return JsonResponse(
+                {"error": "customer_phone must be in E.164 format (e.g. +84901234567)."},
+                status=400,
+            )
+
+        # --- Validate price override ---
+        if price_override is not None:
+            try:
+                price_override = float(price_override)
+                if price_override < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return JsonResponse(
+                    {"error": "price_per_hour_override must be a non-negative number."},
+                    status=400,
+                )
 
         supabase_url, service_key = _get_supabase_keys()
         headers = _supabase_headers(service_key)
 
-        # -----------------------------------------------------------------------
-        # Step 1: Fetch slot
-        # -----------------------------------------------------------------------
-        slot = _fetch_one(
-            f"{supabase_url}/rest/v1/slots",
-            params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
-            headers=headers,
-        )
-        if slot == "error":
-            return JsonResponse({"error": "Slot service unavailable."}, status=503)
-        if slot is None:
-            return JsonResponse({"error": "Slot not found."}, status=404)
+        start_iso = start_at.isoformat()
+        end_iso = end_at.isoformat()
 
         # -----------------------------------------------------------------------
-        # Step 2: Check slot is open
-        # -----------------------------------------------------------------------
-        if slot.get("status") != "open":
-            return JsonResponse(
-                {"error": "Slot unavailable: the slot is no longer open for booking."},
-                status=409,
-            )
-
-        court_id: str = slot["court_id"]
-
-        # -----------------------------------------------------------------------
-        # Step 3: Fetch court — verify ownership
+        # Step 1: Fetch court — verify ownership and get price
         # -----------------------------------------------------------------------
         court = _fetch_one(
             f"{supabase_url}/rest/v1/courts",
             params={
                 "id": f"eq.{court_id}",
-                "select": "id,owner_id,name",
+                "select": "id,owner_id,name,price_per_hour",
                 "limit": "1",
             },
             headers=headers,
@@ -557,16 +606,86 @@ class WalkInBookingView(View):
         if court is None:
             return JsonResponse({"error": "Court not found."}, status=404)
 
-        owner_id: str = court.get("owner_id", "")
+        court_owner_id: str = court.get("owner_id", "")
         court_name: str = court.get("name", "")
+        court_price_per_hour = court.get("price_per_hour")
 
-        if owner_id != user.id:
-            return JsonResponse(
-                {"error": "You do not own this court."}, status=403
-            )
+        if court_owner_id != user.id:
+            return JsonResponse({"error": "You do not own this court."}, status=403)
 
         # -----------------------------------------------------------------------
-        # Step 4: Insert walk-in booking (confirmed, is_walk_in=True)
+        # Step 2: Look for existing slot in this exact window
+        # -----------------------------------------------------------------------
+        try:
+            slot_resp = requests.get(
+                f"{supabase_url}/rest/v1/slots",
+                params={
+                    "court_id": f"eq.{court_id}",
+                    "start_at": f"eq.{start_iso}",
+                    "end_at": f"eq.{end_iso}",
+                    "select": "id,status",
+                    "limit": "1",
+                },
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slot_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        existing_slots = slot_resp.json()
+
+        if existing_slots:
+            existing_slot = existing_slots[0]
+            if existing_slot.get("status") != "open":
+                return JsonResponse(
+                    {"error": "Giờ này đã có slot."},
+                    status=409,
+                )
+            slot_id: str = existing_slot["id"]
+        else:
+            # -----------------------------------------------------------------------
+            # Step 3a: Auto-create a new slot for this window
+            # -----------------------------------------------------------------------
+            try:
+                slot_create_resp = requests.post(
+                    f"{supabase_url}/rest/v1/slots",
+                    json={
+                        "court_id": court_id,
+                        "start_at": start_iso,
+                        "end_at": end_iso,
+                        "status": "open",
+                    },
+                    headers=headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+            if slot_create_resp.status_code not in (200, 201):
+                return JsonResponse({"error": "Failed to create slot."}, status=503)
+
+            slot_rows = slot_create_resp.json()
+            if not slot_rows:
+                return JsonResponse({"error": "Failed to create slot."}, status=503)
+
+            slot_id = slot_rows[0]["id"]
+
+        # -----------------------------------------------------------------------
+        # Step 4: Compute pricing
+        # -----------------------------------------------------------------------
+        effective_price_per_hour = price_override if price_override is not None else (
+            float(court_price_per_hour) if court_price_per_hour is not None else None
+        )
+        duration_minutes: int = int((end_at - start_at).total_seconds() / 60)
+        total_price = None
+        if effective_price_per_hour is not None:
+            total_price = round(effective_price_per_hour * duration_minutes / 60, 2)
+
+        # -----------------------------------------------------------------------
+        # Step 5: Insert walk-in booking (confirmed, is_walk_in=True)
         # -----------------------------------------------------------------------
         insert_data: dict = {
             "slot_id": slot_id,
@@ -578,6 +697,9 @@ class WalkInBookingView(View):
             "customer_name": customer_name or None,
             "customer_phone": customer_phone or None,
             "notes": notes or None,
+            "price_per_hour": effective_price_per_hour,
+            "duration_minutes": duration_minutes,
+            "total_price": total_price,
         }
 
         try:
@@ -601,7 +723,7 @@ class WalkInBookingView(View):
         booking_id: str = booking.get("id", "")
 
         # -----------------------------------------------------------------------
-        # Step 5: Update slot.status = "booked"
+        # Step 6: Update slot.status = "booked"
         # -----------------------------------------------------------------------
         try:
             requests.patch(
@@ -615,11 +737,9 @@ class WalkInBookingView(View):
             pass  # Best-effort
 
         # -----------------------------------------------------------------------
-        # Step 6: Notify owner — walk-in booking confirmed
+        # Step 7: Notify owner — manual/walk-in booking confirmed
         # -----------------------------------------------------------------------
-        slot_time_str = _format_slot_time(
-            slot.get("start_at", ""), slot.get("end_at", "")
-        )
+        slot_time_str = _format_slot_time(start_iso, end_iso)
         display_name = customer_name or "khách"
         _send_notification(
             supabase_url,
