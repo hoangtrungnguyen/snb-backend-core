@@ -191,9 +191,38 @@ def _booking_to_dict(row: dict) -> dict:
         "duration_minutes": row.get("duration_minutes"),
         "total_price": row.get("total_price"),
         "is_auto_approved": row.get("is_auto_approved", False),
+        "is_walk_in": row.get("is_walk_in", False),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
+
+
+def _require_owner(request):
+    """
+    Return (user, None) for authenticated owner users, or (None, JsonResponse) on failure.
+
+    Returns:
+        (user, None)                 — authenticated owner
+        (None, 401 JsonResponse)     — no/invalid token
+        (None, 403 JsonResponse)     — valid token but role != owner
+    """
+    try:
+        result = _authenticate_request(request)
+    except AuthenticationFailed as exc:
+        return None, JsonResponse({"error": str(exc.detail)}, status=401)
+
+    if result is None:
+        return None, JsonResponse(
+            {"error": "Authentication credentials were not provided."}, status=401
+        )
+
+    user, _token = result
+    if user.role != "owner":
+        return None, JsonResponse(
+            {"error": "Only court owners can perform this action."}, status=403
+        )
+
+    return user, None
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +440,199 @@ class BookingCreateView(View):
                 related_booking_id=booking_id,
                 related_slot_id=slot_id,
             )
+
+        return JsonResponse(_booking_to_dict(booking), status=201)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# Walk-in booking view (grava-3432.2 / BCORE-031)
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class WalkInBookingView(View):
+    """
+    POST /api/bookings/walk-in
+
+    Owner creates a manual / walk-in booking for a slot they own.
+    The customer is present in-person; no player JWT needed.
+
+    Acceptance criteria (grava-3432.2 / BCORE-031):
+      1. Owner-only: role must be "owner" (403 otherwise).
+      2. Owner must own the court linked to the slot (403 otherwise).
+      3. slot.status must be "open" (409 if not).
+      4. Booking inserted with:
+           is_walk_in=True, status="confirmed", is_auto_approved=True
+           user_id = owner's UID
+      5. slots.status updated to "booked".
+      6. Owner receives confirmation notification: "Đặt sân thủ công thành công".
+
+    Request body (JSON):
+      {
+        "slot_id":        "<uuid>",   # required
+        "customer_name":  "<str>",    # optional
+        "customer_phone": "<str>",    # optional
+        "notes":          "<str>"     # optional
+      }
+
+    Response 201: booking object (includes is_walk_in=True)
+    Error responses:
+      400 — missing slot_id or invalid JSON
+      401 — missing / invalid token
+      403 — not an owner, or does not own the court
+      404 — slot not found
+      409 — slot not open
+      503 — upstream service unavailable
+    """
+
+    def post(self, request):
+        # --- Auth: owner only ---
+        user, err = _require_owner(request)
+        if err is not None:
+            return err
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
+        # --- Validate required field: slot_id ---
+        slot_id = body.get("slot_id")
+        if not slot_id or not isinstance(slot_id, str) or not slot_id.strip():
+            return JsonResponse({"error": "slot_id is required."}, status=400)
+        slot_id = slot_id.strip()
+
+        customer_name = body.get("customer_name") or ""
+        customer_phone = body.get("customer_phone") or ""
+        notes = body.get("notes") or ""
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # -----------------------------------------------------------------------
+        # Step 1: Fetch slot
+        # -----------------------------------------------------------------------
+        slot = _fetch_one(
+            f"{supabase_url}/rest/v1/slots",
+            params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+            headers=headers,
+        )
+        if slot == "error":
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+        if slot is None:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        # -----------------------------------------------------------------------
+        # Step 2: Check slot is open
+        # -----------------------------------------------------------------------
+        if slot.get("status") != "open":
+            return JsonResponse(
+                {"error": "Slot unavailable: the slot is no longer open for booking."},
+                status=409,
+            )
+
+        court_id: str = slot["court_id"]
+
+        # -----------------------------------------------------------------------
+        # Step 3: Fetch court — verify ownership
+        # -----------------------------------------------------------------------
+        court = _fetch_one(
+            f"{supabase_url}/rest/v1/courts",
+            params={
+                "id": f"eq.{court_id}",
+                "select": "id,owner_id,name",
+                "limit": "1",
+            },
+            headers=headers,
+        )
+        if court == "error":
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+        if court is None:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        owner_id: str = court.get("owner_id", "")
+        court_name: str = court.get("name", "")
+
+        if owner_id != user.id:
+            return JsonResponse(
+                {"error": "You do not own this court."}, status=403
+            )
+
+        # -----------------------------------------------------------------------
+        # Step 4: Insert walk-in booking (confirmed, is_walk_in=True)
+        # -----------------------------------------------------------------------
+        insert_data: dict = {
+            "slot_id": slot_id,
+            "user_id": user.id,
+            "court_id": court_id,
+            "status": "confirmed",
+            "is_walk_in": True,
+            "is_auto_approved": True,
+            "customer_name": customer_name or None,
+            "customer_phone": customer_phone or None,
+            "notes": notes or None,
+        }
+
+        try:
+            booking_resp = requests.post(
+                f"{supabase_url}/rest/v1/bookings",
+                json=insert_data,
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+
+        if booking_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to create booking."}, status=503)
+
+        booking_rows = booking_resp.json()
+        if not booking_rows:
+            return JsonResponse({"error": "Failed to create booking."}, status=503)
+
+        booking = booking_rows[0]
+        booking_id: str = booking.get("id", "")
+
+        # -----------------------------------------------------------------------
+        # Step 5: Update slot.status = "booked"
+        # -----------------------------------------------------------------------
+        try:
+            requests.patch(
+                f"{supabase_url}/rest/v1/slots",
+                params={"id": f"eq.{slot_id}", "select": "id"},
+                json={"status": "booked"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            pass  # Best-effort
+
+        # -----------------------------------------------------------------------
+        # Step 6: Notify owner — walk-in booking confirmed
+        # -----------------------------------------------------------------------
+        slot_time_str = _format_slot_time(
+            slot.get("start_at", ""), slot.get("end_at", "")
+        )
+        display_name = customer_name or "khách"
+        _send_notification(
+            supabase_url,
+            headers,
+            user_id=user.id,
+            title="Đặt sân thủ công thành công",
+            body=(
+                f"Đặt sân thủ công thành công — "
+                f"{court_name} · {slot_time_str} · {display_name}"
+            ),
+            related_booking_id=booking_id,
+            related_slot_id=slot_id,
+        )
 
         return JsonResponse(_booking_to_dict(booking), status=201)
 
