@@ -8,6 +8,22 @@ GET /api/players/me
 
 PATCH /api/players/me
     Updates the player's full_name in public.users.
+
+POST /api/players/me/fcm-token
+    Registers a Firebase Cloud Messaging device token for push notifications.
+    Accepts: {"token": "<non-empty string>"}
+    Appends the token to public.users.fcm_tokens[] (idempotent — no duplicates).
+    Returns 200 on success.
+    Returns 400 if body is invalid/missing token.
+    Returns 503 on network error.
+
+DELETE /api/players/me/fcm-token
+    Removes a Firebase Cloud Messaging device token (e.g. on logout).
+    Accepts: {"token": "<non-empty string>"}
+    Removes the token from public.users.fcm_tokens[].
+    Returns 204 No Content on success.
+    Returns 400 if body is invalid/missing token.
+    Returns 503 on network error.
     Accepts: {"full_name": "<non-empty string>"}
     Returns 200 with updated profile on success.
     Returns 400 if body is invalid/missing full_name.
@@ -27,7 +43,7 @@ import json
 import requests
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.views import View
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
@@ -228,6 +244,134 @@ class PlayersMeView(View):
             },
             status=200,
         )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PlayersFcmTokenView(View):
+    """
+    POST /api/players/me/fcm-token  — register a device token.
+    DELETE /api/players/me/fcm-token — deregister a device token.
+    """
+
+    def _authenticate_player(self, request):
+        """
+        Authenticate + authorise the request as a player.
+
+        Returns (user, None) on success or (None, JsonResponse) on failure.
+        """
+        try:
+            auth_result = _authenticate_request(request)
+        except AuthenticationFailed as exc:
+            return None, JsonResponse({"error": str(exc.detail)}, status=401)
+
+        if auth_result is None:
+            return None, JsonResponse(
+                {"error": "Authentication credentials were not provided."}, status=401
+            )
+
+        user, _token = auth_result
+
+        if user.role != "player":
+            return None, JsonResponse(
+                {"error": "You do not have permission to perform this action."}, status=403
+            )
+
+        return user, None
+
+    def _parse_token_body(self, request):
+        """
+        Parse and validate the request body for a ``token`` field.
+
+        Returns (token_value, None) on success or (None, JsonResponse) on error.
+        """
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return None, JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return None, JsonResponse({"error": "Invalid request body."}, status=400)
+
+        token_value = body.get("token")
+        if token_value is None:
+            return None, JsonResponse({"error": "token is required."}, status=400)
+        if not isinstance(token_value, str):
+            return None, JsonResponse({"error": "token must be a string."}, status=400)
+        if not token_value.strip():
+            return None, JsonResponse({"error": "token must not be empty."}, status=400)
+
+        return token_value.strip(), None
+
+    def _call_rpc(self, supabase_url, service_role_key, rpc_name, params):
+        """
+        Call a Supabase RPC function via POST /rest/v1/rpc/<name>.
+
+        Returns the requests.Response object, or raises requests.RequestException.
+        """
+        rpc_url = f"{supabase_url}/rest/v1/rpc/{rpc_name}"
+        return requests.post(
+            rpc_url,
+            json=params,
+            headers=_supabase_headers(service_role_key),
+            timeout=10,
+        )
+
+    def post(self, request):
+        """Register a FCM device token for the authenticated player."""
+        user, err_response = self._authenticate_player(request)
+        if err_response is not None:
+            return err_response
+
+        fcm_token, err_response = self._parse_token_body(request)
+        if err_response is not None:
+            return err_response
+
+        supabase_url, service_role_key = _get_supabase_keys()
+
+        try:
+            resp = self._call_rpc(
+                supabase_url,
+                service_role_key,
+                "register_fcm_token",
+                {"p_user_id": user.id, "p_token": fcm_token},
+            )
+        except requests.RequestException:
+            return JsonResponse({"error": "FCM token service unavailable."}, status=503)
+
+        if resp.status_code not in (200, 204):
+            return JsonResponse({"error": "FCM token service unavailable."}, status=503)
+
+        return JsonResponse({}, status=200)
+
+    def delete(self, request):
+        """Deregister a FCM device token for the authenticated player."""
+        user, err_response = self._authenticate_player(request)
+        if err_response is not None:
+            return err_response
+
+        fcm_token, err_response = self._parse_token_body(request)
+        if err_response is not None:
+            return err_response
+
+        supabase_url, service_role_key = _get_supabase_keys()
+
+        try:
+            resp = self._call_rpc(
+                supabase_url,
+                service_role_key,
+                "deregister_fcm_token",
+                {"p_user_id": user.id, "p_token": fcm_token},
+            )
+        except requests.RequestException:
+            return JsonResponse({"error": "FCM token service unavailable."}, status=503)
+
+        if resp.status_code not in (200, 204):
+            return JsonResponse({"error": "FCM token service unavailable."}, status=503)
+
+        return HttpResponse(status=204)
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
