@@ -2,12 +2,15 @@
 courts.views -- Court CRUD and Slot management API views.
 
 Endpoints:
-  POST   /api/courts/          -- create court (owner only)
-  GET    /api/courts/          -- list courts (public, paginated, filterable)
-  GET    /api/courts/{id}/     -- court detail (public)
-  PATCH  /api/courts/{id}/     -- update court (owner only)
-  DELETE /api/courts/{id}/     -- soft-delete: sets status=suspended (owner only)
-  POST   /api/courts/slots     -- create slot (owner only) [grava-3106.2]
+  POST   /api/courts/                    -- create court (owner only)
+  GET    /api/courts/                    -- list courts (public, paginated, filterable)
+  GET    /api/courts/{id}/               -- court detail (public)
+  PATCH  /api/courts/{id}/               -- update court (owner only)
+  DELETE /api/courts/{id}/               -- soft-delete: sets status=suspended (owner only)
+  POST   /api/courts/slots               -- create slot (owner only) [grava-3106.2]
+  PATCH  /api/courts/slots/{id}/block    -- block a slot (owner only) [grava-3106.3]
+  PATCH  /api/courts/slots/{id}/unblock  -- unblock a slot (owner only) [grava-3106.3]
+  POST   /api/courts/{id}/recurrence     -- recurring slot schedule generation [grava-3106.4]
 
 grava-3106.1 subtasks:
   grava-3106.1.1 -- POST /courts
@@ -24,11 +27,30 @@ grava-3106.2 subtasks:
   grava-3106.2.2 -- Validates start_at/end_at within court operating_hours
   grava-3106.2.3 -- No overlapping slot for same court (409 Slot conflict)
   grava-3106.2.4 -- is_owner_slot: true -> status=blocked, skip payment
+
+grava-3106.4 (BCORE-023 — OWNER-20 recurring slot schedule):
+  POST /api/courts/{id}/recurrence
+  Body: {days_of_week, start_time, end_time, from_date, until_date}
+  Generates open-availability slots for each matching weekday in the date range.
+  Overlapping slots and days outside operating_hours are silently skipped.
+  Returns: {created, skipped, slots}
+
+grava-3106.5 (BCORE-024 — Weekly schedule & slot detail queries):
+  GET /api/courts/{id}/slots?from=DATE&to=DATE
+      Returns all slots in [from, to) date range with status, booking_id, blocked_reason.
+      Drives CAPP-041 and OWNER-18 weekly grid.
+  GET /api/sports-centers/{id}/schedule?date=DATE
+      Returns all courts for a sports center + their slots for that day.
+      Used by CAPP-045 ScheduleGrid.
+  GET /api/slots/{id}
+      Slot detail: {id, court_id, court_name, start_at, end_at, duration_minutes,
+                    status, access_policy, max_players, blocked_reason, booking_id, notes}.
+      Used by OWNER-32 + booking-context lookups.
 """
 import json
 import re
 import unicodedata
-from datetime import datetime, timezone, time as dt_time
+from datetime import datetime, timezone, time as dt_time, date as dt_date, timedelta
 
 import requests
 from requests import RequestException as _RequestException
@@ -53,6 +75,9 @@ _ACTIVE_BOOKING_STATUSES = ("pending", "confirmed")
 _WEEKDAY_TO_KEY = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 _VALID_SLOT_STATUSES = frozenset(["open", "booked", "blocked", "maintenance"])
+
+_MAX_RECURRENCE_DAYS = 90  # maximum date range for POST /recurrence
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1086,283 @@ class SlotUnblockView(View):
             return JsonResponse({"error": "Slot not found."}, status=404)
 
         return JsonResponse(_slot_to_dict(rows[0]), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+def _parse_date(value: str) -> dt_date | None:
+    """Parse a YYYY-MM-DD string. Returns a date object or None on failure."""
+    if not isinstance(value, str) or not _DATE_RE.match(value):
+        return None
+    try:
+        return dt_date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class RecurrenceView(View):
+    """
+    POST /api/courts/{court_id}/recurrence
+
+    Generate open-availability slots on a recurring weekly schedule (grava-3106.4).
+
+    BCORE-023 / OWNER-20. Distinct from BCORE-036 which generates *bookings*
+    against existing slots — this generates *slots* (open availability).
+
+    Request body:
+      {
+        "days_of_week": ["mon", "wed", "fri"],   # which weekdays to create slots on
+        "start_time":   "09:00",                  # slot start time HH:MM (UTC)
+        "end_time":     "11:00",                  # slot end time HH:MM (UTC)
+        "from_date":    "2026-06-01",             # first day of recurrence YYYY-MM-DD
+        "until_date":   "2026-06-30"              # last day (inclusive) YYYY-MM-DD
+      }
+
+    Response 200:
+      {
+        "created": <int>,    # number of slots successfully inserted
+        "skipped": <int>,    # occurrences skipped (overlap or outside operating_hours)
+        "slots":   [...]     # array of created slot objects
+      }
+
+    Constraints:
+      - Owner auth required; court must belong to the authenticated owner.
+      - until_date - from_date must be <= 90 days.
+      - Overlapping slots are silently skipped (counted in skipped).
+      - Days outside court operating_hours are silently skipped (counted in skipped).
+    """
+
+    def post(self, request, court_id):
+        # --- Auth ---
+        user, err = _require_owner(request)
+        if err is not None:
+            return err
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
+        # --- Validate days_of_week ---
+        days_of_week = body.get("days_of_week")
+        if days_of_week is None:
+            return JsonResponse({"error": "days_of_week is required."}, status=400)
+        if not isinstance(days_of_week, list) or not days_of_week:
+            return JsonResponse(
+                {"error": "days_of_week must be a non-empty list."}, status=400
+            )
+        for day in days_of_week:
+            if day not in _VALID_DAYS:
+                return JsonResponse(
+                    {
+                        "error": (
+                            f"Invalid day \"{day}\" in days_of_week. "
+                            f"Must be one of: {sorted(_VALID_DAYS)}."
+                        )
+                    },
+                    status=400,
+                )
+
+        # --- Validate start_time / end_time ---
+        start_time_raw = body.get("start_time")
+        if not start_time_raw:
+            return JsonResponse({"error": "start_time is required."}, status=400)
+        if not isinstance(start_time_raw, str) or not _TIME_RE.match(start_time_raw):
+            return JsonResponse(
+                {"error": f"start_time \"{start_time_raw}\" is not a valid HH:MM time."},
+                status=400,
+            )
+
+        end_time_raw = body.get("end_time")
+        if not end_time_raw:
+            return JsonResponse({"error": "end_time is required."}, status=400)
+        if not isinstance(end_time_raw, str) or not _TIME_RE.match(end_time_raw):
+            return JsonResponse(
+                {"error": f"end_time \"{end_time_raw}\" is not a valid HH:MM time."},
+                status=400,
+            )
+
+        slot_start_time = _parse_hhmm(start_time_raw)
+        slot_end_time = _parse_hhmm(end_time_raw)
+        if slot_end_time <= slot_start_time:
+            return JsonResponse(
+                {"error": "end_time must be after start_time."}, status=400
+            )
+
+        # --- Validate from_date / until_date ---
+        from_date_raw = body.get("from_date")
+        if not from_date_raw:
+            return JsonResponse({"error": "from_date is required."}, status=400)
+        from_date = _parse_date(from_date_raw)
+        if from_date is None:
+            return JsonResponse(
+                {"error": f"from_date \"{from_date_raw}\" is not a valid YYYY-MM-DD date."},
+                status=400,
+            )
+
+        until_date_raw = body.get("until_date")
+        if not until_date_raw:
+            return JsonResponse({"error": "until_date is required."}, status=400)
+        until_date = _parse_date(until_date_raw)
+        if until_date is None:
+            return JsonResponse(
+                {"error": f"until_date \"{until_date_raw}\" is not a valid YYYY-MM-DD date."},
+                status=400,
+            )
+
+        if until_date < from_date:
+            return JsonResponse(
+                {"error": "until_date must be on or after from_date."}, status=400
+            )
+
+        # --- Enforce 90-day maximum ---
+        if (until_date - from_date).days > _MAX_RECURRENCE_DAYS:
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Date range must not exceed {_MAX_RECURRENCE_DAYS} days "
+                        f"(got {(until_date - from_date).days} days)."
+                    )
+                },
+                status=400,
+            )
+
+        # --- Fetch court (verify existence + ownership + operating_hours) ---
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+        courts_url = f"{supabase_url}/rest/v1/courts"
+        slots_url = f"{supabase_url}/rest/v1/slots"
+
+        try:
+            court_resp = requests.get(
+                courts_url,
+                params={"id": f"eq.{court_id}", "select": "id,owner_id,operating_hours", "limit": "1"},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if court_resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        court_rows = court_resp.json()
+        if not court_rows:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court = court_rows[0]
+        if court.get("owner_id") != user.id:
+            return JsonResponse(
+                {"error": "You do not have permission to modify this court."}, status=403
+            )
+
+        operating_hours = court.get("operating_hours")
+        days_of_week_set = set(days_of_week)
+
+        # --- Generate occurrences ---
+        created_slots = []
+        skipped = 0
+
+        current = from_date
+        while current <= until_date:
+            day_key = _WEEKDAY_TO_KEY[current.weekday()]
+
+            if day_key not in days_of_week_set:
+                current += timedelta(days=1)
+                continue
+
+            # Build UTC datetimes for this occurrence
+            start_dt = datetime(
+                current.year, current.month, current.day,
+                slot_start_time.hour, slot_start_time.minute,
+                tzinfo=timezone.utc,
+            )
+            end_dt = datetime(
+                current.year, current.month, current.day,
+                slot_end_time.hour, slot_end_time.minute,
+                tzinfo=timezone.utc,
+            )
+
+            # Check operating_hours — skip if outside
+            hours_error = _validate_slot_within_operating_hours(start_dt, end_dt, operating_hours)
+            if hours_error:
+                skipped += 1
+                current += timedelta(days=1)
+                continue
+
+            # Check for overlapping slots
+            start_iso = start_dt.isoformat()
+            end_iso = end_dt.isoformat()
+            try:
+                overlap_resp = requests.get(
+                    slots_url,
+                    params={
+                        "court_id": f"eq.{court_id}",
+                        "start_at": f"lt.{end_iso}",
+                        "end_at": f"gt.{start_iso}",
+                        "select": "id",
+                        "limit": "1",
+                    },
+                    headers=headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                skipped += 1
+                current += timedelta(days=1)
+                continue
+
+            if overlap_resp.status_code != 200 or overlap_resp.json():
+                skipped += 1
+                current += timedelta(days=1)
+                continue
+
+            # Insert the slot
+            insert_data = {
+                "court_id": court_id,
+                "start_at": start_iso,
+                "end_at": end_iso,
+                "status": "open",
+                "is_owner_slot": False,
+            }
+            try:
+                create_resp = requests.post(
+                    slots_url,
+                    json=insert_data,
+                    headers=headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                skipped += 1
+                current += timedelta(days=1)
+                continue
+
+            if create_resp.status_code not in (200, 201):
+                skipped += 1
+                current += timedelta(days=1)
+                continue
+
+            rows = create_resp.json()
+            if rows:
+                created_slots.append(_slot_to_dict(rows[0]))
+            else:
+                skipped += 1
+
+            current += timedelta(days=1)
+
+        return JsonResponse(
+            {
+                "created": len(created_slots),
+                "skipped": skipped,
+                "slots": created_slots,
+            },
+            status=200,
+        )
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
