@@ -13,29 +13,69 @@ PATCH /api/players/me
     Returns 400 if body is invalid/missing full_name.
     Returns 404 if user not found.
     Returns 503 on network error.
+
+POST /api/players/me/avatar
+    Uploads a JPEG or PNG avatar (max 2 MB) to Supabase Storage and updates
+    public.users.avatar_url.
+    Accepts: multipart/form-data with field "avatar".
+    Returns 200 with {"avatar_url": "<url>"} on success.
+    Returns 400 for missing file, oversized file, or wrong MIME type.
+    Returns 503 on network error.
 """
 import json
 
 import requests
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.http import JsonResponse
 from django.views import View
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.exceptions import AuthenticationFailed
 
-from auth_ext.authentication import SupabaseJWTAuthentication
+from players.validators import validate_avatar_file
+
+_CONTENT_TYPE_TO_EXT = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+}
+
+_AVATAR_BUCKET = "avatars"
 
 
 def _authenticate_request(request):
     """
-    Authenticate the request using SupabaseJWTAuthentication.
+    Authenticate the request using the shared Supabase JWT decoder.
 
-    Returns (user, None) on success, or raises an exception on failure.
+    Extracts and decodes the Bearer token; role is read from the JWT
+    ``app_metadata.role`` claim (same as the middleware).
+
+    Returns (SupabaseUser, token) on success, or None when no token is
+    present.  Raises AuthenticationFailed on invalid/expired tokens.
     """
-    authenticator = SupabaseJWTAuthentication()
-    result = authenticator.authenticate(request)
-    return result
+    from auth_ext.middleware import _decode_token
+    from auth_ext.authentication import SupabaseUser
+
+    auth_header = request.META.get("HTTP_AUTHORIZATION", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+
+    token = auth_header[len("Bearer "):]
+    if not token:
+        return None
+
+    payload = _decode_token(token)
+    if payload is None:
+        raise AuthenticationFailed("Invalid or expired token.")
+
+    uid = payload.get("sub")
+    if not uid:
+        raise AuthenticationFailed("Token is missing the 'sub' claim.")
+
+    app_metadata = payload.get("app_metadata") or {}
+    role = app_metadata.get("role") or "authenticated"
+
+    return SupabaseUser(uid=uid, role=role), token
 
 
 def _get_supabase_keys():
@@ -188,6 +228,90 @@ class PlayersMeView(View):
             },
             status=200,
         )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PlayersMeAvatarView(View):
+    """POST /api/players/me/avatar — upload avatar to Supabase Storage."""
+
+    def post(self, request):
+        try:
+            auth_result = _authenticate_request(request)
+        except AuthenticationFailed as exc:
+            return JsonResponse({"error": str(exc.detail)}, status=401)
+
+        if auth_result is None:
+            return JsonResponse(
+                {"error": "Authentication credentials were not provided."}, status=401
+            )
+
+        user, _token = auth_result
+
+        if user.role != "player":
+            return JsonResponse(
+                {"error": "You do not have permission to perform this action."}, status=403
+            )
+
+        avatar = request.FILES.get("avatar")
+        if avatar is None:
+            return JsonResponse({"error": "avatar file is required."}, status=400)
+
+        try:
+            validate_avatar_file(avatar)
+        except ValidationError as exc:
+            return JsonResponse({"error": exc.messages[0]}, status=400)
+
+        ext = _CONTENT_TYPE_TO_EXT.get(avatar.content_type, "jpg")
+        storage_path = f"{user.id}/avatar.{ext}"
+        supabase_url, service_role_key = _get_supabase_keys()
+        upload_url = f"{supabase_url}/storage/v1/object/{_AVATAR_BUCKET}/{storage_path}"
+
+        try:
+            upload_resp = requests.post(
+                upload_url,
+                data=avatar.read(),
+                headers={
+                    "apikey": service_role_key,
+                    "Authorization": f"Bearer {service_role_key}",
+                    "Content-Type": avatar.content_type,
+                    "x-upsert": "true",
+                },
+                timeout=30,
+            )
+        except requests.RequestException:
+            return JsonResponse({"error": "Avatar upload service unavailable."}, status=503)
+
+        if upload_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Avatar upload failed."}, status=503)
+
+        avatar_url = (
+            f"{supabase_url}/storage/v1/object/public/{_AVATAR_BUCKET}/{storage_path}"
+        )
+
+        users_endpoint = f"{supabase_url}/rest/v1/users"
+        try:
+            patch_resp = requests.patch(
+                users_endpoint,
+                params={"id": f"eq.{user.id}"},
+                json={"avatar_url": avatar_url},
+                headers={
+                    "apikey": service_role_key,
+                    "Authorization": f"Bearer {service_role_key}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                timeout=10,
+            )
+        except requests.RequestException:
+            return JsonResponse({"error": "Player profile service unavailable."}, status=503)
+
+        if patch_resp.status_code not in (200, 204):
+            return JsonResponse({"error": "Player profile service unavailable."}, status=503)
+
+        return JsonResponse({"avatar_url": avatar_url}, status=200)
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
