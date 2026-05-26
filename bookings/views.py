@@ -758,3 +758,260 @@ class ManualBookingView(View):
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# Booking status transitions (grava-3432.3 / BCORE-032)
+# ---------------------------------------------------------------------------
+
+# Valid booking status values
+_VALID_BOOKING_STATUSES = frozenset({"pending", "confirmed", "cancelled", "completed"})
+
+# Allowed transitions per (current_status, target_status) → frozenset of actor roles.
+# Actor roles: "owner" = court owner, "player_self" = the booking's own player.
+_TRANSITION_RULES: dict[tuple[str, str], frozenset[str]] = {
+    # pending → confirmed: only court owner (OWNER-23)
+    ("pending", "confirmed"): frozenset({"owner"}),
+    # pending → cancelled: court owner (OWNER-24) OR the booking player (CAPP-052)
+    ("pending", "cancelled"): frozenset({"owner", "player_self"}),
+    # confirmed → cancelled: court owner (OWNER-24) OR the booking player (CAPP-052)
+    ("confirmed", "cancelled"): frozenset({"owner", "player_self"}),
+    # confirmed → completed: only court owner
+    ("confirmed", "completed"): frozenset({"owner"}),
+}
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BookingStatusView(View):
+    """
+    PATCH /api/bookings/<booking_id>/status
+
+    Transition a booking's status.  Allowed transitions:
+
+      pending   → confirmed  (court owner only — OWNER-23)
+      pending   → cancelled  (court owner OR booking player — OWNER-24 / CAPP-052)
+      confirmed → cancelled  (court owner OR booking player — OWNER-24 / CAPP-052)
+      confirmed → completed  (court owner only)
+
+    On cancellation the linked slot is restored to "open".
+    On approval/completion the slot stays "booked".
+
+    Notifications (fire-and-forget):
+      confirmed : player receives "Đặt sân đã được duyệt — [court] · [time]"
+      cancelled : player receives "Đặt sân bị từ chối — [court] · [time]"
+      completed : player receives "Sân đã hoàn thành — [court] · [time]"
+
+    Request body (JSON):
+      { "status": "confirmed" | "cancelled" | "completed" }
+
+    Responses:
+      200 — updated booking object
+      400 — missing/invalid status, or invalid JSON
+      401 — no/invalid token
+      403 — not authorised for this transition
+      404 — booking not found
+      409 — transition not allowed from current state
+      503 — upstream error
+    """
+
+    def patch(self, request, booking_id: str):
+        # --- Auth: any authenticated user ---
+        user, err = _require_authenticated(request)
+        if err is not None:
+            return err
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return JsonResponse({"error": "Invalid request body."}, status=400)
+
+        target_status = body.get("status")
+        if not target_status or not isinstance(target_status, str):
+            return JsonResponse({"error": "status is required."}, status=400)
+
+        target_status = target_status.strip()
+        if target_status not in _VALID_BOOKING_STATUSES:
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Invalid status '{target_status}'. "
+                        f"Must be one of: {', '.join(sorted(_VALID_BOOKING_STATUSES))}."
+                    )
+                },
+                status=400,
+            )
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # -----------------------------------------------------------------------
+        # Step 1: Fetch the booking
+        # -----------------------------------------------------------------------
+        booking = _fetch_one(
+            f"{supabase_url}/rest/v1/bookings",
+            params={"id": f"eq.{booking_id}", "select": "*", "limit": "1"},
+            headers=headers,
+        )
+        if booking == "error":
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+        if booking is None:
+            return JsonResponse({"error": "Booking not found."}, status=404)
+
+        current_status: str = booking.get("status", "")
+        booking_user_id: str = booking.get("user_id", "")
+        court_id: str = booking.get("court_id", "")
+        slot_id: str = booking.get("slot_id", "")
+
+        # -----------------------------------------------------------------------
+        # Step 2: Fetch the court (to verify ownership and get name)
+        # -----------------------------------------------------------------------
+        court = _fetch_one(
+            f"{supabase_url}/rest/v1/courts",
+            params={
+                "id": f"eq.{court_id}",
+                "select": "id,owner_id,name",
+                "limit": "1",
+            },
+            headers=headers,
+        )
+        if court == "error":
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+        if court is None:
+            return JsonResponse({"error": "Court not found."}, status=404)
+
+        court_owner_id: str = court.get("owner_id", "")
+        court_name: str = court.get("name", "")
+
+        # -----------------------------------------------------------------------
+        # Step 3: Determine actor roles for this request
+        # -----------------------------------------------------------------------
+        is_court_owner = (user.id == court_owner_id)
+        is_booking_player = (user.id == booking_user_id)
+
+        actor_roles: set[str] = set()
+        if is_court_owner:
+            actor_roles.add("owner")
+        if is_booking_player:
+            actor_roles.add("player_self")
+
+        # -----------------------------------------------------------------------
+        # Step 4: Validate the transition
+        # -----------------------------------------------------------------------
+        transition_key = (current_status, target_status)
+        allowed_actors = _TRANSITION_RULES.get(transition_key)
+
+        if allowed_actors is None:
+            # No rule found — either same-state or disallowed cross-state transition
+            if current_status == target_status:
+                return JsonResponse(
+                    {"error": f"Booking is already in '{current_status}' status."},
+                    status=409,
+                )
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Cannot transition booking from '{current_status}' "
+                        f"to '{target_status}'."
+                    )
+                },
+                status=409,
+            )
+
+        # Check actor authorisation for this specific transition
+        if not (actor_roles & allowed_actors):
+            return JsonResponse(
+                {"error": "You are not authorised to perform this status transition."},
+                status=403,
+            )
+
+        # -----------------------------------------------------------------------
+        # Step 5: Fetch slot (for notification message and potential slot restore)
+        # -----------------------------------------------------------------------
+        slot = _fetch_one(
+            f"{supabase_url}/rest/v1/slots",
+            params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
+            headers=headers,
+        )
+        slot_start_at = ""
+        slot_end_at = ""
+        if slot and slot != "error":
+            slot_start_at = slot.get("start_at", "")
+            slot_end_at = slot.get("end_at", "")
+
+        slot_time_str = _format_slot_time(slot_start_at, slot_end_at) if slot_start_at else ""
+
+        # -----------------------------------------------------------------------
+        # Step 6: Apply the booking status update in Supabase
+        # -----------------------------------------------------------------------
+        try:
+            patch_resp = requests.patch(
+                f"{supabase_url}/rest/v1/bookings",
+                params={"id": f"eq.{booking_id}", "select": "*"},
+                json={"status": target_status},
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+
+        if patch_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to update booking."}, status=503)
+
+        updated_rows = patch_resp.json()
+        if not updated_rows:
+            return JsonResponse({"error": "Failed to update booking."}, status=503)
+
+        updated_booking = updated_rows[0]
+
+        # -----------------------------------------------------------------------
+        # Step 7: Restore slot to "open" on cancellation (best-effort)
+        # -----------------------------------------------------------------------
+        if target_status == "cancelled":
+            try:
+                requests.patch(
+                    f"{supabase_url}/rest/v1/slots",
+                    params={"id": f"eq.{slot_id}", "select": "id"},
+                    json={"status": "open"},
+                    headers=headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                pass  # Best-effort; non-fatal
+
+        # -----------------------------------------------------------------------
+        # Step 8: Fire-and-forget notification to the booking player
+        # -----------------------------------------------------------------------
+        notification_map: dict[str, tuple[str, str]] = {
+            "confirmed": (
+                "Đặt sân đã được duyệt",
+                f"Đặt sân đã được duyệt — {court_name} · {slot_time_str}",
+            ),
+            "cancelled": (
+                "Đặt sân bị từ chối",
+                f"Đặt sân bị từ chối — {court_name} · {slot_time_str}",
+            ),
+            "completed": (
+                "Sân đã hoàn thành",
+                f"Sân đã hoàn thành — {court_name} · {slot_time_str}",
+            ),
+        }
+        if target_status in notification_map:
+            notif_title, notif_body = notification_map[target_status]
+            _send_notification(
+                supabase_url,
+                headers,
+                user_id=booking_user_id,
+                title=notif_title,
+                body=notif_body,
+                related_booking_id=booking_id,
+                related_slot_id=slot_id,
+            )
+
+        return JsonResponse(_booking_to_dict(updated_booking), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
