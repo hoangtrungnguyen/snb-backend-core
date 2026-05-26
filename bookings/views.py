@@ -448,6 +448,214 @@ class BookingCreateView(View):
 
 
 # ---------------------------------------------------------------------------
+# Booking list & search view (grava-3432.4 / BCORE-033)
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BookingListView(View):
+    """
+    GET /api/bookings/list
+
+    Returns paginated bookings visible to the authenticated user.
+
+    Access rules:
+      - Player: sees only their own bookings (user_id = caller).
+      - Owner:  sees all bookings for their courts.
+
+    Query parameters (all optional):
+      court_id   — filter by court UUID
+      status     — filter by status (pending | confirmed | cancelled | completed)
+      from_date  — ISO date (YYYY-MM-DD); include bookings created on or after this date
+      to_date    — ISO date (YYYY-MM-DD); include bookings created on or before this date
+      page       — page number (default 1)
+      page_size  — items per page (default 20, max 100)
+
+    Response 200:
+      {
+        "results":   [ <booking>, ... ],
+        "page":      <int>,
+        "page_size": <int>
+      }
+
+    Error responses:
+      401 — missing / invalid token
+      503 — upstream service unavailable
+    """
+
+    def get(self, request):
+        user, err = _require_authenticated(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        # Pagination params
+        try:
+            page = max(1, int(request.GET.get("page", 1)))
+        except (ValueError, TypeError):
+            page = 1
+        try:
+            page_size = min(100, max(1, int(request.GET.get("page_size", 20))))
+        except (ValueError, TypeError):
+            page_size = 20
+        offset = (page - 1) * page_size
+
+        # Build Supabase query params as list to allow duplicate keys.
+        query_items: list = [
+            ("select", "*"),
+            ("order", "created_at.desc"),
+            ("limit", str(page_size)),
+            ("offset", str(offset)),
+        ]
+
+        # Access-scoping: owner sees their courts' bookings; player sees only own bookings.
+        if user.role == "owner":
+            # Fetch the owner's court IDs first.
+            try:
+                courts_resp = requests.get(
+                    f"{supabase_url}/rest/v1/courts",
+                    params={"owner_id": f"eq.{user.id}", "select": "id"},
+                    headers=headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+            if courts_resp.status_code != 200:
+                return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+            court_rows = courts_resp.json()
+            if not court_rows:
+                # Owner has no courts — return empty result set immediately.
+                return JsonResponse(
+                    {"results": [], "page": page, "page_size": page_size}, status=200
+                )
+
+            court_ids = [r["id"] for r in court_rows]
+            query_items.append(("court_id", f"in.({','.join(court_ids)})"))
+        else:
+            # Player: only their own bookings.
+            query_items.append(("user_id", f"eq.{user.id}"))
+
+        # Optional filters
+        court_id_filter = request.GET.get("court_id")
+        if court_id_filter:
+            # Override the scope filter with a specific court filter.
+            query_items = [(k, v) for k, v in query_items if k != "court_id"]
+            query_items.append(("court_id", f"eq.{court_id_filter}"))
+
+        status_filter = request.GET.get("status")
+        if status_filter:
+            query_items.append(("status", f"eq.{status_filter}"))
+
+        from_date = request.GET.get("from_date")
+        if from_date:
+            query_items.append(("created_at", f"gte.{from_date}"))
+
+        to_date = request.GET.get("to_date")
+        if to_date:
+            query_items.append(("created_at", f"lte.{to_date}T23:59:59Z"))
+
+        try:
+            resp = requests.get(
+                f"{supabase_url}/rest/v1/bookings",
+                params=query_items,
+                headers=headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+
+        if resp.status_code != 200:
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+
+        rows = resp.json()
+        results = [_booking_to_dict(r) for r in rows]
+        return JsonResponse(
+            {"results": results, "page": page, "page_size": page_size}, status=200
+        )
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# Booking detail view (grava-3432.4 / BCORE-033)
+# ---------------------------------------------------------------------------
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BookingDetailView(View):
+    """
+    GET /api/bookings/{id}
+
+    Returns a single booking by ID.
+
+    Access rules:
+      - Player: may only fetch their own booking (user_id = caller).
+      - Owner:  may fetch any booking for a court they own.
+
+    Response 200: booking object
+    Error responses:
+      401 — missing / invalid token
+      403 — not the booking owner and not the court owner
+      404 — booking not found
+      503 — upstream service unavailable
+    """
+
+    def get(self, request, booking_id: str):
+        user, err = _require_authenticated(request)
+        if err is not None:
+            return err
+
+        supabase_url, service_key = _get_supabase_keys()
+        headers = _supabase_headers(service_key)
+
+        booking = _fetch_one(
+            f"{supabase_url}/rest/v1/bookings",
+            params={"id": f"eq.{booking_id}", "select": "*", "limit": "1"},
+            headers=headers,
+        )
+
+        if booking == "error":
+            return JsonResponse({"error": "Booking service unavailable."}, status=503)
+        if booking is None:
+            return JsonResponse({"error": "Booking not found."}, status=404)
+
+        # Access control check
+        if user.role == "owner":
+            # Owner must own the court referenced by this booking.
+            court = _fetch_one(
+                f"{supabase_url}/rest/v1/courts",
+                params={
+                    "id": f"eq.{booking['court_id']}",
+                    "select": "id,owner_id",
+                    "limit": "1",
+                },
+                headers=headers,
+            )
+            if court == "error":
+                return JsonResponse({"error": "Court service unavailable."}, status=503)
+            if court is None or court.get("owner_id") != user.id:
+                return JsonResponse(
+                    {"error": "You do not have access to this booking."}, status=403
+                )
+        else:
+            # Player: must be the booking owner.
+            if booking.get("user_id") != user.id:
+                return JsonResponse(
+                    {"error": "You do not have access to this booking."}, status=403
+                )
+
+        return JsonResponse(_booking_to_dict(booking), status=200)
+
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        return JsonResponse({"error": "Method not allowed."}, status=405)
+
+
+# ---------------------------------------------------------------------------
 # Manual / walk-in booking view (grava-3432.2 / BCORE-031)
 # ---------------------------------------------------------------------------
 
