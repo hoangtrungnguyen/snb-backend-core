@@ -2,6 +2,7 @@ from django.urls import path
 from .views import (
     CourtsListView,
     CourtDetailView,
+    CourtSlugLookupView,
     SlotsView,
     SlotBlockView,
     SlotUnblockView,
@@ -13,6 +14,8 @@ app_name = "courts"
 
 urlpatterns = [
     path("", CourtsListView.as_view(), name="courts-list"),
+    # grava-3106.6 — slug lookup must come before the <court_id> catch-all
+    path("by-slug/<str:slug>", CourtSlugLookupView.as_view(), name="courts-by-slug"),
     path("slots", SlotsView.as_view(), name="slots-create"),
     path("slots/<str:slot_id>/block", SlotBlockView.as_view(), name="slots-block"),
     path("slots/<str:slot_id>/unblock", SlotUnblockView.as_view(), name="slots-unblock"),
