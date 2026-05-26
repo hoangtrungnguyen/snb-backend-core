@@ -94,16 +94,28 @@ TEMPLATES = [
 WSGI_APPLICATION = "spb_core.wsgi.application"
 
 # ---------------------------------------------------------------------------
-# Database — loaded from DATABASE_URL env var.
-# Local settings override with SQLite; prod supplies a real DATABASE_URL.
+# Database — built from individual vars or DATABASE_URL fallback.
 # ---------------------------------------------------------------------------
 
-DATABASES = {
-    "default": env.db(
-        "DATABASE_URL",
-        default="sqlite:///db.sqlite3",
-    )
-}
+_db_host = env.str("DATABASE_HOST", default="")
+if _db_host:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": env.str("DATABASE_NAME"),
+            "USER": env.str("DATABASE_USER"),
+            "PASSWORD": env.str("DATABASE_PASSWORD"),
+            "HOST": _db_host,
+            "PORT": env.str("DATABASE_PORT", default="5432"),
+        }
+    }
+else:
+    DATABASES = {
+        "default": env.db(
+            "DATABASE_URL",
+            default="sqlite:///db.sqlite3",
+        )
+    }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
@@ -165,8 +177,9 @@ REST_FRAMEWORK = {
 # ---------------------------------------------------------------------------
 
 SUPABASE_URL = env.str("SUPABASE_URL", default="")
-SUPABASE_ANON_KEY = env.str("SUPABASE_ANON_KEY", default="")
-SUPABASE_SERVICE_ROLE_KEY = env.str("SUPABASE_SERVICE_ROLE_KEY", default="")
+# Accept SUPABASE_KEY (publishable) or SUPABASE_ANON_KEY interchangeably
+SUPABASE_ANON_KEY = env.str("SUPABASE_ANON_KEY", default="") or env.str("SUPABASE_KEY", default="")
+SUPABASE_SERVICE_ROLE_KEY = env.str("SUPABASE_SERVICE_ROLE_KEY", default="") or SUPABASE_ANON_KEY
 SUPABASE_JWKS_URL = env.str(
     "SUPABASE_JWKS_URL",
     default=f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else "",
