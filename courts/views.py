@@ -219,10 +219,18 @@ def _require_owner(request):
 
 def _geocode_address(address: str):
     """
-    Call Google Maps Geocoding API to convert *address* to (lat, lng).
+    Call Google Maps Geocoding API to convert *address* to coordinates.
 
-    Returns (lat, lng) floats or (None, None) on failure / no results.
+    Returns a 3-tuple (lat, lng, formatted_address) on success, or
+    (None, None, None) on failure / no results / missing API key.
+
+    - lat, lng: float coordinates from the first geocoding result.
+    - formatted_address: canonical address string from the first result
+      (grava-5044.2.4). Callers should store this as the canonical `address`.
+
     Uses GOOGLE_MAPS_API_KEY from settings if available.
+    If geocoding fails for any reason, returns (None, None, None) — the court
+    should still be saved with lat=null, lng=null (grava-5044.2.3).
     """
     api_key = getattr(settings, "GOOGLE_MAPS_API_KEY", "")
     params = {"address": address}
@@ -237,11 +245,13 @@ def _geocode_address(address: str):
         data = resp.json()
         results = data.get("results", [])
         if results:
-            loc = results[0]["geometry"]["location"]
-            return loc["lat"], loc["lng"]
+            first = results[0]
+            loc = first["geometry"]["location"]
+            formatted = first.get("formatted_address")
+            return loc["lat"], loc["lng"], formatted
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 
 def _build_unique_slug(base_slug: str, supabase_url: str, service_key: str) -> str:
@@ -480,11 +490,15 @@ class CourtsListView(View):
         base_slug = _generate_slug(name.strip())
         slug = _build_unique_slug(base_slug, supabase_url, service_key)
 
-        # Geocode address
+        # Geocode address (grava-5044.2.1, 5044.2.2, 5044.2.3, 5044.2.4)
         address = body.get("address")
         lat, lng = None, None
         if address:
-            lat, lng = _geocode_address(address)
+            lat, lng, formatted_address = _geocode_address(address)
+            # grava-5044.2.4: use formatted_address as canonical address if available
+            # grava-5044.2.3: if geocoding fails, keep original address as-is
+            if formatted_address:
+                address = formatted_address
 
         # Build insert payload
         insert_data = {
@@ -612,6 +626,24 @@ class CourtDetailView(View):
         if not update_data:
             return JsonResponse({"error": "No updatable fields provided."}, status=400)
 
+        # Geocode when address is being updated (grava-5044.2.1, 5044.2.2, 5044.2.3, 5044.2.4)
+        geocode_failed = False
+        if "address" in update_data and update_data["address"]:
+            new_address = update_data["address"]
+            lat, lng, formatted_address = _geocode_address(new_address)
+            if lat is not None and lng is not None:
+                # grava-5044.2.2: store geocoded coordinates
+                update_data["lat"] = lat
+                update_data["lng"] = lng
+                # grava-5044.2.4: use formatted_address as canonical address
+                if formatted_address:
+                    update_data["address"] = formatted_address
+            else:
+                # grava-5044.2.3: geocoding failed — clear lat/lng, keep original address
+                update_data["lat"] = None
+                update_data["lng"] = None
+                geocode_failed = True
+
         courts_url = f"{supabase_url}/rest/v1/courts"
         try:
             resp = requests.patch(
@@ -631,7 +663,12 @@ class CourtDetailView(View):
         if not rows:
             return JsonResponse({"error": "Court not found."}, status=404)
 
-        return JsonResponse(_court_to_dict(rows[0]), status=200)
+        court_data = _court_to_dict(rows[0])
+        if geocode_failed:
+            # grava-5044.2.3: return 207 Multi-Status with geocoding warning
+            court_data["warnings"] = ["Geocoding failed: address saved but lat/lng not updated."]
+            return JsonResponse(court_data, status=207)
+        return JsonResponse(court_data, status=200)
 
     def delete(self, request, court_id):
         """
