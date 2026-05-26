@@ -14,6 +14,8 @@ urlpatterns = [
     path("auth/", include("auth_ext.urls")),
     path("api/players/", include("players.urls")),
     path("api/courts/", include("courts.urls")),
+    # grava-3432.1 — atomic single-time booking
+    path("api/bookings", include("bookings.urls")),
     # grava-3106.5.2 — sports center schedule
     path(
         "api/sports-centers/<str:sc_id>/schedule",
