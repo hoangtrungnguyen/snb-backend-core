@@ -1,0 +1,37 @@
+# SportBuddies Core Engine API
+
+Backend API for the SportBuddies platform (court owners + players).
+Optimized for developer integration and AI tool calling.
+
+## API Entrypoints
+- OpenAPI Spec (JSON): [/api/schema/](/api/schema/) — import this into LLM system tools / SDK generators.
+- Interactive Playground (Swagger): [/api/docs/swagger/](/api/docs/swagger/) — for manual browser testing.
+- Reference Docs (Redoc): [/api/docs/redoc/](/api/docs/redoc/) — clean reading view.
+
+## Authentication
+- All `/api/players/*` endpoints require a Supabase-issued JWT:
+  `Authorization: Bearer <ACCESS_TOKEN>`.
+- Obtain tokens via `POST /auth/player/login` or `POST /auth/owner/login`.
+- Refresh an expired access token via `POST /auth/refresh`.
+- Auth endpoints under `/auth/*` are public (no Bearer token required).
+
+## Rules for AI Agents
+- Player endpoints require `role=player` in the JWT; a mismatched role returns `403`.
+- Every failure returns a top-level `error` key (often with a human-readable `detail`).
+- Login/forgot-password errors are intentionally generic to prevent user enumeration.
+- `POST /auth/player/resend-verification` is rate limited to 1 request/minute per email;
+  expect `429` with a `retry_after` (seconds) field on breach.
+- Avatar upload accepts only JPEG/PNG up to 2 MB via `multipart/form-data`.
+
+## Endpoint Groups
+- `Auth` — `/auth/owner/*`, `/auth/player/*`, `/auth/refresh`, `/auth/callback` (public).
+- `Players` — `/api/players/me*` (authenticated, role=player).
+- `Courts` — `/api/courts/*`: list/detail (public GET), create/update/delete & settings (owner).
+- `Slots` — `/api/courts/slots*`, `/api/slots/*`, `/api/slot-join-requests/*`: availability,
+  blocking, recurrence, and play-together join requests. Public reads; owner/player writes.
+- `Bookings` — `/api/bookings*`: single + manual/walk-in booking, status transitions, price estimate.
+
+Series and notifications endpoints are not yet documented in the OpenAPI spec.
+
+## Health
+- `GET /health/` — unauthenticated liveness/readiness probe (`200` ok, `503` degraded).
