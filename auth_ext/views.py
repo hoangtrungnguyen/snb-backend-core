@@ -157,10 +157,31 @@ class OwnerLoginView(View):
                 status=200,
             )
 
-        # Supabase returned an error — map any 4xx to a generic 401.
-        # We deliberately do NOT expose Supabase's error_description to prevent
-        # user-enumeration attacks (wrong email vs wrong password must be indistinguishable).
+        # Supabase returned an error.
         if 400 <= supabase_resp.status_code < 500:
+            try:
+                err = supabase_resp.json()
+            except ValueError:
+                err = {}
+
+            # Unconfirmed accounts are rejected by Supabase at the token
+            # endpoint (when "Confirm email" is on), so the email_confirmed_at
+            # check above never sees them. Surface this as a distinct 403 so the
+            # dashboard can prompt the owner to verify instead of showing a
+            # generic "wrong credentials". This intentionally reveals that the
+            # account exists — an accepted trade-off for the verify-email UX.
+            if err.get("error_code") == "email_not_confirmed":
+                return JsonResponse(
+                    {
+                        "error": "email_not_verified",
+                        "detail": "Please verify your email before logging in.",
+                    },
+                    status=403,
+                )
+
+            # Any other 4xx maps to a generic 401. We deliberately do NOT expose
+            # Supabase's error_description to prevent user-enumeration attacks
+            # (wrong email vs wrong password must be indistinguishable).
             return JsonResponse(
                 {"error": "invalid_credentials", "detail": "Invalid credentials"},
                 status=401,
