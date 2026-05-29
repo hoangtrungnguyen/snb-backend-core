@@ -50,6 +50,7 @@ DJANGO_APPS = [
 
 THIRD_PARTY_APPS = [
     "rest_framework",
+    "drf_spectacular",
     "corsheaders",
 ]
 
@@ -176,6 +177,56 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+# ---------------------------------------------------------------------------
+# drf-spectacular (OpenAPI 3.0 schema)
+# ---------------------------------------------------------------------------
+# The live endpoints are plain django.views.View instances (manual auth +
+# JsonResponse), which drf-spectacular cannot introspect. The schema is instead
+# generated from a dedicated documentation URLConf of @api_view doc-stubs
+# (see spb_core.api_docs) wired into SpectacularAPIView(urlconf=...) in urls.
+# This keeps the real views untouched while still producing an accurate spec.
+SPECTACULAR_SETTINGS = {
+    "TITLE": "SportBuddies Core Engine API",
+    "DESCRIPTION": (
+        "Backend API for the SportBuddies platform (court owners + players). "
+        "Optimized for developer integration and AI tool calling. "
+        "All authenticated endpoints expect a Supabase-issued JWT as a Bearer token. "
+        "Every error response carries a top-level `error` key (and often a `detail`)."
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "COMPONENT_SPLIT_REQUEST": True,
+    # Supabase JWT Bearer scheme. Applied globally; public endpoints clear it
+    # per-operation with @extend_schema(auth=[]).
+    "APPEND_COMPONENTS": {
+        "securitySchemes": {
+            "BearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
+        }
+    },
+    "SECURITY": [{"BearerAuth": []}],
+    # The health endpoint reuses an ok/error choice set across three fields;
+    # name it once to avoid the "multiple names for the same choice set" warning.
+    "ENUM_NAME_OVERRIDES": {
+        "HealthStatusEnum": ["ok", "error"],
+        "SlotStatusEnum": ["open", "booked", "blocked", "maintenance"],
+        "BookingStatusEnum": ["pending", "confirmed", "cancelled", "completed"],
+        "BookingStatusTransitionEnum": ["confirmed", "cancelled", "completed"],
+        "JoinRequestStatusEnum": ["pending", "approved", "rejected"],
+        "JoinStatusEnum": ["pending", "approved", "rejected", "none"],
+        "AccessPolicyEnum": ["open", "private"],
+    },
+    "TAGS": [
+        {"name": "Auth — Owner", "description": "Court owner authentication."},
+        {"name": "Auth — Player", "description": "Player authentication & OAuth."},
+        {"name": "Players", "description": "Authenticated player profile & devices."},
+        {"name": "Courts", "description": "Court catalog, detail, settings & discovery."},
+        {"name": "Slots", "description": "Availability slots, blocking, recurrence & play-together joins."},
+        {"name": "Bookings", "description": "Single, manual & recurring bookings + pricing."},
+        {"name": "System", "description": "Health & operational endpoints."},
+    ],
 }
 
 # ---------------------------------------------------------------------------

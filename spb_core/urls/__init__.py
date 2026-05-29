@@ -4,6 +4,12 @@ Root URL configuration for snb-backend-core.
 
 from django.contrib import admin
 from django.urls import include, path
+from django.views.generic import TemplateView
+from drf_spectacular.views import (
+    SpectacularAPIView,
+    SpectacularRedocView,
+    SpectacularSwaggerView,
+)
 
 from spb_core.views import dashboard, health
 from courts.views import (
@@ -87,4 +93,22 @@ urlpatterns = [
         SlotLastMinuteView.as_view(),
         name="slot-last-minute",
     ),
+
+    # ------------------------------------------------------------------
+    # API documentation (drf-spectacular)
+    # The schema is generated from the documentation URLConf of @api_view
+    # doc-stubs (spb_core.api_docs) — NOT the real plain-View routes above,
+    # which spectacular cannot introspect.
+    # ------------------------------------------------------------------
+    # Structured data port (OpenAPI 3.0 JSON/YAML) -> AI agents & SDK gen
+    path(
+        "api/schema/",
+        SpectacularAPIView.as_view(urlconf="spb_core.api_docs"),
+        name="schema",
+    ),
+    # Interactive UIs -> human developers
+    path("api/docs/swagger/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path("api/docs/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
+    # LLM crawler entrypoint
+    path("llms.txt", TemplateView.as_view(template_name="llms.txt", content_type="text/plain"), name="llms-txt"),
 ]
