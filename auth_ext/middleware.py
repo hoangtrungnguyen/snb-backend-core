@@ -112,7 +112,10 @@ def _decode_token(token: str) -> dict | None:
         claims = jose_jwt.decode(
             token,
             jwks,
-            algorithms=["RS256"],
+            # Supabase's new asymmetric JWT signing keys use ES256; legacy/other
+            # projects may use RS256. Accept both so verification works across
+            # the new and old key models.
+            algorithms=["ES256", "RS256"],
             audience=_get_audience(),
         )
         return claims
