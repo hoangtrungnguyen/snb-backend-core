@@ -435,13 +435,15 @@ class PlayerSignupView(View):
 class OwnerSignupView(View):
     """Handle POST /auth/owner/signup.
 
-    Creates an auto-confirmed Supabase auth user via the admin API and
-    promotes the corresponding `customers` row from the trigger-inserted
-    default role ``player`` to ``owner``.
+    Creates a Supabase auth user via the public signUp flow (so Supabase sends
+    an email-confirmation message; the account is unconfirmed until the link is
+    clicked), then assigns the owner role: stamps ``app_metadata.role="owner"``
+    and promotes the trigger-inserted `customers` row from ``player`` to
+    ``owner``.
 
     Body: {"email": "...", "password": "..."}
     Returns:
-        201 {"message": "Owner account created", "user": {"id", "email"}}
+        201 {"message": "Confirmation email sent", "user": {"id", "email"}}
         400 on invalid body, missing fields, or password rule violations
         409 {"error": "email_already_registered"} when Supabase returns 422
         502/503 on upstream auth/profile service failure
@@ -468,30 +470,56 @@ class OwnerSignupView(View):
                 status=400,
             )
 
-        admin = get_admin_client()
+        # Use the public signUp flow (publishable key) so Supabase sends the
+        # email-confirmation message; the account stays unconfirmed until the
+        # owner clicks the link, and OwnerLoginView rejects logins until then.
+        app_base_url = getattr(settings, "APP_BASE_URL", "")
+        credentials = {"email": email, "password": password}
+        if app_base_url:
+            credentials["options"] = {
+                "email_redirect_to": f"{app_base_url}/auth/callback?type=email"
+            }
 
         try:
-            created = admin.auth.admin.create_user(
-                {"email": email, "password": password, "email_confirm": True}
-            )
+            auth_resp = get_anon_client().auth.sign_up(credentials)
         except AuthApiError as exc:
             if exc.status == 422:
                 return JsonResponse({"error": "email_already_registered"}, status=409)
             logger.error(
-                "Supabase admin create_user error %s: %s", exc.status, exc.message
+                "Supabase owner signup error %s: %s", exc.status, exc.message
             )
             return JsonResponse({"error": "Signup failed."}, status=503)
         except Exception as exc:
-            logger.error("Supabase admin create_user transport error: %s", exc)
+            logger.error("Supabase owner signup transport error: %s", exc)
             return JsonResponse({"error": "Authentication service unavailable."}, status=502)
 
-        user = created.user
+        user = auth_resp.user
         user_id = getattr(user, "id", None)
         user_email = getattr(user, "email", email)
 
-        # Promote the customers row inserted by the handle_new_user trigger
-        # from default role='player' to 'owner'.
-        if user_id:
+        # Enumeration guard: when the email already exists and confirmations are
+        # on, GoTrue returns a user with NO identities (and no error) instead of
+        # revealing the conflict. Skip the privileged role assignment in that
+        # case so an attacker can't promote someone else's account to owner.
+        identities = getattr(user, "identities", None)
+        already_exists = identities is not None and len(identities) == 0
+
+        # The public signUp flow cannot set privileged fields, so use the admin
+        # client to assign the owner role: (1) stamp app_metadata.role="owner"
+        # so issued JWTs carry the role the auth middleware reads, and (2)
+        # promote the customers row inserted by the handle_new_user trigger from
+        # the default role="player" to "owner".
+        if user_id and not already_exists:
+            admin = get_admin_client()
+            try:
+                admin.auth.admin.update_user_by_id(
+                    user_id, {"app_metadata": {"role": "owner"}}
+                )
+            except Exception as exc:
+                logger.error("owner app_metadata role update failed: %s", exc)
+                return JsonResponse(
+                    {"error": "User profile service unavailable."}, status=503
+                )
             try:
                 admin.table("customers").update({"role": "owner"}).eq(
                     "id", user_id
@@ -503,7 +531,7 @@ class OwnerSignupView(View):
                 )
 
         return JsonResponse(
-            {"message": "Owner account created", "user": {"id": user_id, "email": user_email}},
+            {"message": "Confirmation email sent", "user": {"id": user_id, "email": user_email}},
             status=201,
         )
 

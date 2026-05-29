@@ -50,6 +50,7 @@ DJANGO_APPS = [
 
 THIRD_PARTY_APPS = [
     "rest_framework",
+    "corsheaders",
 ]
 
 LOCAL_APPS = [
@@ -65,6 +66,10 @@ LOCAL_APPS = [
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
 MIDDLEWARE = [
+    # CorsMiddleware must run before CommonMiddleware (and any middleware that
+    # may generate a response) so CORS headers land on every response,
+    # including preflight (OPTIONS).
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -207,3 +212,19 @@ if _missing_supabase_keys:
 
 _default_jwks = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else ""
 SUPABASE_JWKS_URL = env.str("SUPABASE_JWKS_URL", default=_default_jwks)
+
+# ---------------------------------------------------------------------------
+# CORS (django-cors-headers)
+# ---------------------------------------------------------------------------
+# Cross-origin browser clients (e.g. the owner dashboard) need the backend to
+# echo Access-Control-Allow-Origin on preflight + actual responses. Configure
+# the allowed origins via the CORS_ALLOWED_ORIGINS env var (comma-separated);
+# defaults cover the local dashboard dev ports.
+CORS_ALLOWED_ORIGINS = env.list(
+    "CORS_ALLOWED_ORIGINS",
+    default=[
+        "http://127.0.0.1:8090",
+        "http://localhost:8090",
+    ],
+)
+CORS_ALLOW_CREDENTIALS = True

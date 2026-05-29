@@ -11,6 +11,10 @@ DEBUG = True
 
 ALLOWED_HOSTS = ["*"]
 
+# Dev convenience: accept any browser origin so the dashboard works regardless
+# of which localhost port it runs on. Production relies on CORS_ALLOWED_ORIGINS.
+CORS_ALLOW_ALL_ORIGINS = True  # noqa: F405
+
 # Use Postgres when DATABASE_HOST is set (real Supabase), otherwise SQLite.
 import os as _os
 if _os.environ.get("DATABASE_HOST"):

@@ -11,3 +11,4 @@ channels-redis>=4.2
 gunicorn>=21.2
 whitenoise>=6.6
 supabase>=2.7
+django-cors-headers>=4.0
