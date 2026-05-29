@@ -2,17 +2,17 @@
 players.views — Player profile views.
 
 GET /api/players/me
-    Returns the current authenticated player's profile from public.users.
+    Returns the current authenticated player's profile from public.customers.
     Requires: SupabaseJWTAuthentication + IsPlayer permission.
     Returns 404 if user not found, 503 on network error.
 
 PATCH /api/players/me
-    Updates the player's full_name in public.users.
+    Updates the player's full_name in public.customers.
 
 POST /api/players/me/fcm-token
     Registers a Firebase Cloud Messaging device token for push notifications.
     Accepts: {"token": "<non-empty string>"}
-    Appends the token to public.users.fcm_tokens[] (idempotent — no duplicates).
+    Appends the token to public.customers.fcm_tokens[] (idempotent — no duplicates).
     Returns 200 on success.
     Returns 400 if body is invalid/missing token.
     Returns 503 on network error.
@@ -20,7 +20,7 @@ POST /api/players/me/fcm-token
 DELETE /api/players/me/fcm-token
     Removes a Firebase Cloud Messaging device token (e.g. on logout).
     Accepts: {"token": "<non-empty string>"}
-    Removes the token from public.users.fcm_tokens[].
+    Removes the token from public.customers.fcm_tokens[].
     Returns 204 No Content on success.
     Returns 400 if body is invalid/missing token.
     Returns 503 on network error.
@@ -32,7 +32,7 @@ DELETE /api/players/me/fcm-token
 
 POST /api/players/me/avatar
     Uploads a JPEG or PNG avatar (max 2 MB) to Supabase Storage and updates
-    public.users.avatar_url.
+    public.customers.avatar_url.
     Accepts: multipart/form-data with field "avatar".
     Returns 200 with {"avatar_url": "<url>"} on success.
     Returns 400 for missing file, oversized file, or wrong MIME type.
@@ -49,6 +49,7 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.exceptions import AuthenticationFailed
 
+from auth_ext.rest import user_headers
 from players.validators import validate_avatar_file
 
 _CONTENT_TYPE_TO_EXT = {
@@ -91,26 +92,12 @@ def _authenticate_request(request):
     app_metadata = payload.get("app_metadata") or {}
     role = app_metadata.get("role") or "authenticated"
 
-    return SupabaseUser(uid=uid, role=role), token
+    return SupabaseUser(uid=uid, role=role, token=token), token
 
 
-def _get_supabase_keys():
-    """Return (supabase_url, service_role_key) from settings."""
-    supabase_url = getattr(settings, "SUPABASE_URL", "")
-    supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-    service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "") or supabase_anon_key
-    return supabase_url, service_role_key
-
-
-def _supabase_headers(service_role_key):
-    """Return common headers for Supabase REST API calls."""
-    return {
-        "apikey": service_role_key,
-        "Authorization": f"Bearer {service_role_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Prefer": "return=representation",
-    }
+def _rest_base():
+    """Base URL for Supabase REST calls."""
+    return getattr(settings, "SUPABASE_URL", "")
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -150,8 +137,7 @@ class PlayersMeView(View):
         if err_response is not None:
             return err_response
 
-        supabase_url, service_role_key = _get_supabase_keys()
-        users_endpoint = f"{supabase_url}/rest/v1/users"
+        users_endpoint = f"{_rest_base()}/rest/v1/customers"
 
         try:
             resp = requests.get(
@@ -161,7 +147,7 @@ class PlayersMeView(View):
                     "select": "id,email,name,phone,role",
                     "limit": "1",
                 },
-                headers=_supabase_headers(service_role_key),
+                headers=user_headers(user.token),
                 timeout=10,
             )
         except requests.RequestException:
@@ -209,8 +195,7 @@ class PlayersMeView(View):
         if not full_name.strip():
             return JsonResponse({"error": "full_name must not be empty."}, status=400)
 
-        supabase_url, service_role_key = _get_supabase_keys()
-        users_endpoint = f"{supabase_url}/rest/v1/users"
+        users_endpoint = f"{_rest_base()}/rest/v1/customers"
 
         try:
             resp = requests.patch(
@@ -220,7 +205,7 @@ class PlayersMeView(View):
                     "select": "id,email,name,phone,role",
                 },
                 json={"name": full_name.strip()},
-                headers=_supabase_headers(service_role_key),
+                headers=user_headers(user.token),
                 timeout=10,
             )
         except requests.RequestException:
@@ -305,17 +290,18 @@ class PlayersFcmTokenView(View):
 
         return token_value.strip(), None
 
-    def _call_rpc(self, supabase_url, service_role_key, rpc_name, params):
+    def _call_rpc(self, user_token, rpc_name, params):
         """
         Call a Supabase RPC function via POST /rest/v1/rpc/<name>.
 
-        Returns the requests.Response object, or raises requests.RequestException.
+        Runs in RLS mode as the calling user. Returns the requests.Response
+        object, or raises requests.RequestException.
         """
-        rpc_url = f"{supabase_url}/rest/v1/rpc/{rpc_name}"
+        rpc_url = f"{_rest_base()}/rest/v1/rpc/{rpc_name}"
         return requests.post(
             rpc_url,
             json=params,
-            headers=_supabase_headers(service_role_key),
+            headers=user_headers(user_token),
             timeout=10,
         )
 
@@ -329,12 +315,9 @@ class PlayersFcmTokenView(View):
         if err_response is not None:
             return err_response
 
-        supabase_url, service_role_key = _get_supabase_keys()
-
         try:
             resp = self._call_rpc(
-                supabase_url,
-                service_role_key,
+                user.token,
                 "register_fcm_token",
                 {"p_user_id": user.id, "p_token": fcm_token},
             )
@@ -356,12 +339,9 @@ class PlayersFcmTokenView(View):
         if err_response is not None:
             return err_response
 
-        supabase_url, service_role_key = _get_supabase_keys()
-
         try:
             resp = self._call_rpc(
-                supabase_url,
-                service_role_key,
+                user.token,
                 "deregister_fcm_token",
                 {"p_user_id": user.id, "p_token": fcm_token},
             )
@@ -410,19 +390,20 @@ class PlayersMeAvatarView(View):
 
         ext = _CONTENT_TYPE_TO_EXT.get(avatar.content_type, "jpg")
         storage_path = f"{user.id}/avatar.{ext}"
-        supabase_url, service_role_key = _get_supabase_keys()
-        upload_url = f"{supabase_url}/storage/v1/object/{_AVATAR_BUCKET}/{storage_path}"
+        base = _rest_base()
+        upload_url = f"{base}/storage/v1/object/{_AVATAR_BUCKET}/{storage_path}"
+
+        # Storage upload runs in RLS mode (user JWT); override Content-Type for
+        # the binary body and add the upsert flag.
+        upload_headers = user_headers(user.token, prefer=None)
+        upload_headers["Content-Type"] = avatar.content_type
+        upload_headers["x-upsert"] = "true"
 
         try:
             upload_resp = requests.post(
                 upload_url,
                 data=avatar.read(),
-                headers={
-                    "apikey": service_role_key,
-                    "Authorization": f"Bearer {service_role_key}",
-                    "Content-Type": avatar.content_type,
-                    "x-upsert": "true",
-                },
+                headers=upload_headers,
                 timeout=30,
             )
         except requests.RequestException:
@@ -432,21 +413,16 @@ class PlayersMeAvatarView(View):
             return JsonResponse({"error": "Avatar upload failed."}, status=503)
 
         avatar_url = (
-            f"{supabase_url}/storage/v1/object/public/{_AVATAR_BUCKET}/{storage_path}"
+            f"{base}/storage/v1/object/public/{_AVATAR_BUCKET}/{storage_path}"
         )
 
-        users_endpoint = f"{supabase_url}/rest/v1/users"
+        users_endpoint = f"{base}/rest/v1/customers"
         try:
             patch_resp = requests.patch(
                 users_endpoint,
                 params={"id": f"eq.{user.id}"},
                 json={"avatar_url": avatar_url},
-                headers={
-                    "apikey": service_role_key,
-                    "Authorization": f"Bearer {service_role_key}",
-                    "Content-Type": "application/json",
-                    "Prefer": "return=minimal",
-                },
+                headers=user_headers(user.token, prefer="return=minimal"),
                 timeout=10,
             )
         except requests.RequestException:
@@ -541,8 +517,7 @@ class PlayersMeLocationView(View):
 
         # --- Update last_lat / last_lng in Supabase ---
         # grava-5044.4.3: no history stored — only current location is updated
-        supabase_url, service_role_key = _get_supabase_keys()
-        users_endpoint = f"{supabase_url}/rest/v1/users"
+        users_endpoint = f"{_rest_base()}/rest/v1/customers"
 
         try:
             resp = requests.patch(
@@ -552,7 +527,7 @@ class PlayersMeLocationView(View):
                     "select": "id,last_lat,last_lng",
                 },
                 json={"last_lat": lat, "last_lng": lng},
-                headers=_supabase_headers(service_role_key),
+                headers=user_headers(user.token),
                 timeout=10,
             )
         except requests.RequestException:

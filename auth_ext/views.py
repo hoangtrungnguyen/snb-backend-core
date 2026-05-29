@@ -13,7 +13,7 @@ POST /auth/owner/forgot-password
     Calls Supabase Auth resetPasswordForEmail (POST /auth/v1/recover)
     Always returns HTTP 200 {"message": "If that email exists, a reset link has been sent"}
     Anti-enumeration: response is identical whether email exists or not.
-    Uses SUPABASE_ANON_KEY (not service role key).
+    Uses SUPABASE_PUBLISHABLE_KEY (not service role key).
 
 POST /auth/player/signup
     Accepts {"email": "...", "password": "..."}
@@ -53,7 +53,7 @@ class OwnerLoginView(View):
         Returns a 403 JsonResponse if the user is not found or has a non-owner role.
         """
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
+        service_role_key = getattr(settings, "SUPABASE_SECRET_KEY", "")
 
         users_endpoint = f"{supabase_url}/rest/v1/customers"
 
@@ -104,7 +104,7 @@ class OwnerLoginView(View):
             return JsonResponse({"error": "password is required."}, status=400)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
 
         token_endpoint = f"{supabase_url}/auth/v1/token"
 
@@ -195,7 +195,7 @@ class OwnerForgotPasswordView(View):
             return JsonResponse({"error": "email is required."}, status=400)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
 
         recover_endpoint = f"{supabase_url}/auth/v1/recover"
 
@@ -247,7 +247,7 @@ class TokenRefreshView(View):
             return JsonResponse({"error": "refresh_token is required."}, status=400)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
 
         token_endpoint = f"{supabase_url}/auth/v1/token"
 
@@ -316,7 +316,7 @@ def _check_google_oauth_provider(supabase_url: str, service_role_key: str, email
     """
     if not service_role_key:
         logger.warning(
-            "SUPABASE_SERVICE_ROLE_KEY not set; cannot check identity provider for email=%s",
+            "SUPABASE_SECRET_KEY not set; cannot check identity provider for email=%s",
             email,
         )
         return False
@@ -399,7 +399,7 @@ class PlayerSignupView(View):
         except AuthApiError as exc:
             if exc.status == 422:
                 supabase_url = getattr(settings, "SUPABASE_URL", "")
-                service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
+                service_role_key = getattr(settings, "SUPABASE_SECRET_KEY", "")
                 if _check_google_oauth_provider(supabase_url, service_role_key, email):
                     return JsonResponse(
                         {"code": "account_exists_other_provider"},
@@ -528,8 +528,8 @@ class AuthCallbackView(View):
             return JsonResponse({"error": "Missing required parameter: code."}, status=400)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-        supabase_service_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
+        supabase_service_key = getattr(settings, "SUPABASE_SECRET_KEY", "")
         frontend_url = getattr(settings, "FRONTEND_URL", "/")
 
         # ------------------------------------------------------------------
@@ -729,7 +729,7 @@ class AuthCallbackView(View):
 
 def _supabase_token_request(email: str, password: str) -> requests.Response:
     supabase_url = getattr(settings, "SUPABASE_URL", "")
-    supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+    supabase_anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
     return requests.post(
         f"{supabase_url}/auth/v1/token",
         params={"grant_type": "password"},
@@ -794,7 +794,7 @@ class PlayerForgotPasswordView(View):
             return JsonResponse({"error": "email is required."}, status=400)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
         app_base_url = getattr(settings, "APP_BASE_URL", "")
 
         try:
@@ -837,7 +837,7 @@ class PlayerResendVerificationView(View):
         cache.set(cache_key, time.time(), timeout=_RESEND_RATE_LIMIT_SECONDS)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        supabase_anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
         app_base_url = getattr(settings, "APP_BASE_URL", "")
 
         try:

@@ -46,9 +46,12 @@ class SupabaseUser:
 
     is_authenticated: bool = True
 
-    def __init__(self, *, uid: str, role: str) -> None:
+    def __init__(self, *, uid: str, role: str, token: str | None = None) -> None:
         self.id = uid
         self.role = role
+        #: The raw Supabase JWT this user authenticated with. Used to build
+        #: RLS-mode PostgREST requests (see ``auth_ext.rest.user_headers``).
+        self.token = token
 
     def __str__(self) -> str:  # pragma: no cover
         return f"SupabaseUser(id={self.id}, role={self.role})"
@@ -105,7 +108,7 @@ class SupabaseJWTAuthentication(BaseAuthentication):
         if db_user is None:
             raise AuthenticationFailed("User not found.")
 
-        user = SupabaseUser(uid=uid, role=db_user.get("role", "authenticated"))
+        user = SupabaseUser(uid=uid, role=db_user.get("role", "authenticated"), token=token)
         return user, token
 
     def authenticate_header(self, request):  # pragma: no cover
@@ -144,7 +147,7 @@ class SupabaseJWTAuthentication(BaseAuthentication):
         from django.db import connection
         with connection.cursor() as cur:
             cur.execute(
-                "SELECT id, role, email FROM public.users WHERE id = %s LIMIT 1",
+                "SELECT id, role, email FROM public.customers WHERE id = %s LIMIT 1",
                 [uid],
             )
             row = cur.fetchone()

@@ -28,7 +28,7 @@ RATE_LIMIT_SECONDS = 60
 
 @override_settings(
     SUPABASE_URL="https://test.supabase.co",
-    SUPABASE_ANON_KEY="test-anon-key",
+    SUPABASE_PUBLISHABLE_KEY="test-anon-key",
     APP_BASE_URL="https://myapp.example.com",
     CACHES={
         "default": {

@@ -70,6 +70,8 @@ from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.exceptions import AuthenticationFailed
 
+from auth_ext.rest import anon_headers, user_headers
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -144,22 +146,9 @@ def _validate_operating_hours(hours) -> None:
                 )
 
 
-def _get_supabase_keys():
-    """Return (supabase_url, service_role_key) from settings."""
-    supabase_url = getattr(settings, "SUPABASE_URL", "")
-    anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-    service_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "") or anon_key
-    return supabase_url, service_key
-
-
-def _supabase_headers(key):
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Prefer": "return=representation",
-    }
+def _rest_base() -> str:
+    """Base URL for Supabase REST calls."""
+    return getattr(settings, "SUPABASE_URL", "")
 
 
 def _authenticate_request(request):
@@ -190,7 +179,7 @@ def _authenticate_request(request):
 
     app_metadata = payload.get("app_metadata") or {}
     role = app_metadata.get("role") or "authenticated"
-    return SupabaseUser(uid=uid, role=role), token
+    return SupabaseUser(uid=uid, role=role, token=token), token
 
 
 def _require_owner(request):
@@ -254,7 +243,7 @@ def _geocode_address(address: str):
     return None, None, None
 
 
-def _build_unique_slug(base_slug: str, supabase_url: str, service_key: str) -> str:
+def _build_unique_slug(base_slug: str, supabase_url: str, headers: dict) -> str:
     """
     Check Supabase for slug uniqueness and append a numeric suffix on collision.
     """
@@ -266,7 +255,7 @@ def _build_unique_slug(base_slug: str, supabase_url: str, service_key: str) -> s
             check = requests.get(
                 courts_url,
                 params={"slug": f"eq.{candidate}", "select": "id", "limit": "1"},
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=5,
             )
             rows = check.json() if check.status_code == 200 else []
@@ -410,7 +399,8 @@ class CourtsListView(View):
 
     def get(self, request):
         """List courts with optional filters: owner_id, sport_type, status."""
-        supabase_url, service_key = _get_supabase_keys()
+        supabase_url = _rest_base()
+        headers = anon_headers()
         courts_url = f"{supabase_url}/rest/v1/courts"
 
         params = {
@@ -439,7 +429,7 @@ class CourtsListView(View):
             resp = requests.get(
                 courts_url,
                 params=params,
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -484,11 +474,12 @@ class CourtsListView(View):
         except ValueError as exc:
             return JsonResponse({"error": str(exc)}, status=400)
 
-        supabase_url, service_key = _get_supabase_keys()
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # Generate slug
         base_slug = _generate_slug(name.strip())
-        slug = _build_unique_slug(base_slug, supabase_url, service_key)
+        slug = _build_unique_slug(base_slug, supabase_url, headers)
 
         # Geocode address (grava-5044.2.1, 5044.2.2, 5044.2.3, 5044.2.4)
         address = body.get("address")
@@ -527,7 +518,7 @@ class CourtsListView(View):
             resp = requests.post(
                 courts_url,
                 json=insert_data,
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -554,14 +545,14 @@ class CourtDetailView(View):
     DELETE /api/courts/{id}/ -- soft-delete (owner only)
     """
 
-    def _fetch_court(self, court_id: str, supabase_url: str, service_key: str):
+    def _fetch_court(self, court_id: str, supabase_url: str, headers: dict):
         """Fetch a single court row by id. Returns dict or None."""
         courts_url = f"{supabase_url}/rest/v1/courts"
         try:
             resp = requests.get(
                 courts_url,
                 params={"id": f"eq.{court_id}", "select": "*", "limit": "1"},
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -575,8 +566,9 @@ class CourtDetailView(View):
 
     def get(self, request, court_id):
         """Public endpoint -- no auth required."""
-        supabase_url, service_key = _get_supabase_keys()
-        court = self._fetch_court(court_id, supabase_url, service_key)
+        supabase_url = _rest_base()
+        headers = anon_headers()
+        court = self._fetch_court(court_id, supabase_url, headers)
         if court == "error":
             return JsonResponse({"error": "Court service unavailable."}, status=503)
         if court is None:
@@ -604,10 +596,11 @@ class CourtDetailView(View):
             except ValueError as exc:
                 return JsonResponse({"error": str(exc)}, status=400)
 
-        supabase_url, service_key = _get_supabase_keys()
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # Fetch court to check ownership
-        court = self._fetch_court(court_id, supabase_url, service_key)
+        court = self._fetch_court(court_id, supabase_url, headers)
         if court == "error":
             return JsonResponse({"error": "Court service unavailable."}, status=503)
         if court is None:
@@ -650,7 +643,7 @@ class CourtDetailView(View):
                 courts_url,
                 params={"id": f"eq.{court_id}", "select": "*"},
                 json=update_data,
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -679,10 +672,11 @@ class CourtDetailView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # Fetch court to check ownership
-        court = self._fetch_court(court_id, supabase_url, service_key)
+        court = self._fetch_court(court_id, supabase_url, headers)
         if court == "error":
             return JsonResponse({"error": "Court service unavailable."}, status=503)
         if court is None:
@@ -704,7 +698,7 @@ class CourtDetailView(View):
                     "select": "id",
                     "limit": "1",
                 },
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -722,7 +716,7 @@ class CourtDetailView(View):
                 courts_url,
                 params={"id": f"eq.{court_id}", "select": "*"},
                 json={"status": "suspended"},
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -830,8 +824,8 @@ class SlotsView(View):
                     status=400,
                 )
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # --- Fetch court (to verify existence and operating_hours) ---
         courts_url = f"{supabase_url}/rest/v1/courts"
@@ -933,14 +927,14 @@ class SlotBlockView(View):
     grava-3106.3.1
     """
 
-    def _fetch_slot(self, slot_id: str, supabase_url: str, service_key: str):
+    def _fetch_slot(self, slot_id: str, supabase_url: str, headers: dict):
         """Fetch a single slot row by id. Returns dict, None, or 'error'."""
         slots_url = f"{supabase_url}/rest/v1/slots"
         try:
             resp = requests.get(
                 slots_url,
                 params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -952,14 +946,14 @@ class SlotBlockView(View):
             return None
         return rows[0]
 
-    def _fetch_court(self, court_id: str, supabase_url: str, service_key: str):
+    def _fetch_court(self, court_id: str, supabase_url: str, headers: dict):
         """Fetch a single court row by id. Returns dict, None, or 'error'."""
         courts_url = f"{supabase_url}/rest/v1/courts"
         try:
             resp = requests.get(
                 courts_url,
                 params={"id": f"eq.{court_id}", "select": "id,owner_id", "limit": "1"},
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -977,17 +971,18 @@ class SlotBlockView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # --- Fetch slot ---
-        slot = self._fetch_slot(slot_id, supabase_url, service_key)
+        slot = self._fetch_slot(slot_id, supabase_url, headers)
         if slot == "error":
             return JsonResponse({"error": "Slot service unavailable."}, status=503)
         if slot is None:
             return JsonResponse({"error": "Slot not found."}, status=404)
 
         # --- Ownership: fetch the court and verify owner ---
-        court = self._fetch_court(slot["court_id"], supabase_url, service_key)
+        court = self._fetch_court(slot["court_id"], supabase_url, headers)
         if court == "error":
             return JsonResponse({"error": "Court service unavailable."}, status=503)
         if court is None or court.get("owner_id") != user.id:
@@ -1019,7 +1014,7 @@ class SlotBlockView(View):
                 slots_url,
                 params={"id": f"eq.{slot_id}", "select": "*"},
                 json=update_data,
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -1049,14 +1044,14 @@ class SlotUnblockView(View):
     grava-3106.3.2
     """
 
-    def _fetch_slot(self, slot_id: str, supabase_url: str, service_key: str):
+    def _fetch_slot(self, slot_id: str, supabase_url: str, headers: dict):
         """Fetch a single slot row by id. Returns dict, None, or 'error'."""
         slots_url = f"{supabase_url}/rest/v1/slots"
         try:
             resp = requests.get(
                 slots_url,
                 params={"id": f"eq.{slot_id}", "select": "*", "limit": "1"},
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -1068,14 +1063,14 @@ class SlotUnblockView(View):
             return None
         return rows[0]
 
-    def _fetch_court(self, court_id: str, supabase_url: str, service_key: str):
+    def _fetch_court(self, court_id: str, supabase_url: str, headers: dict):
         """Fetch a single court row by id. Returns dict, None, or 'error'."""
         courts_url = f"{supabase_url}/rest/v1/courts"
         try:
             resp = requests.get(
                 courts_url,
                 params={"id": f"eq.{court_id}", "select": "id,owner_id", "limit": "1"},
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -1093,17 +1088,18 @@ class SlotUnblockView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # --- Fetch slot ---
-        slot = self._fetch_slot(slot_id, supabase_url, service_key)
+        slot = self._fetch_slot(slot_id, supabase_url, headers)
         if slot == "error":
             return JsonResponse({"error": "Slot service unavailable."}, status=503)
         if slot is None:
             return JsonResponse({"error": "Slot not found."}, status=404)
 
         # --- Ownership: fetch the court and verify owner ---
-        court = self._fetch_court(slot["court_id"], supabase_url, service_key)
+        court = self._fetch_court(slot["court_id"], supabase_url, headers)
         if court == "error":
             return JsonResponse({"error": "Court service unavailable."}, status=503)
         if court is None or court.get("owner_id") != user.id:
@@ -1119,7 +1115,7 @@ class SlotUnblockView(View):
                 slots_url,
                 params={"id": f"eq.{slot_id}", "select": "*"},
                 json=update_data,
-                headers=_supabase_headers(service_key),
+                headers=headers,
                 timeout=10,
             )
         except _RequestException:
@@ -1281,8 +1277,8 @@ class RecurrenceView(View):
             )
 
         # --- Fetch court (verify existence + ownership + operating_hours) ---
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
         courts_url = f"{supabase_url}/rest/v1/courts"
         slots_url = f"{supabase_url}/rest/v1/slots"
 
@@ -1519,8 +1515,8 @@ class CourtSlotsRangeView(View):
                 {"error": f"to \"{to_raw}\" is not a valid YYYY-MM-DD date."}, status=400
             )
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = anon_headers()
 
         # --- Fetch court (verify existence) ---
         courts_url = f"{supabase_url}/rest/v1/courts"
@@ -1619,8 +1615,8 @@ class SportsCenterScheduleView(View):
                 {"error": f"date \"{date_raw}\" is not a valid YYYY-MM-DD date."}, status=400
             )
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = anon_headers()
 
         # --- Fetch all courts for this sports center ---
         courts_url = f"{supabase_url}/rest/v1/courts"
@@ -1717,8 +1713,8 @@ class SlotDetailView(View):
     """
 
     def get(self, request, slot_id):
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = anon_headers()
 
         # --- Fetch slot ---
         slots_url = f"{supabase_url}/rest/v1/slots"
@@ -1794,8 +1790,8 @@ class CourtSlugLookupView(View):
     """
 
     def get(self, request, slug: str):
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = anon_headers()
 
         # grava-3106.6.2 — case-insensitive: lowercase the slug before querying
         normalized_slug = slug.lower()
@@ -1971,8 +1967,8 @@ class CourtsNearbyView(View):
         sport = request.GET.get("sport")
 
         # --- Build Supabase query ---
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = anon_headers()
         courts_url = f"{supabase_url}/rest/v1/courts"
 
         params = {
@@ -2227,8 +2223,8 @@ class SlotAccessView(View):
                     status=400,
                 )
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # Fetch slot
         try:
@@ -2335,8 +2331,8 @@ class SlotJoinView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # Fetch slot
         try:
@@ -2525,8 +2521,8 @@ class SlotJoinRequestApproveView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         join_request, err = _resolve_join_request_owner(
             supabase_url, headers, join_request_id, user.id
@@ -2586,16 +2582,18 @@ class SlotJoinRequestApproveView(View):
 
         # Fire-and-forget notification to requester
         try:
+            # Cross-user notification (owner → requester): use the SECURITY
+            # DEFINER create_notification RPC; a user_id=auth.uid() INSERT policy
+            # could never permit inserting a row owned by the requester.
             requests.post(
-                f"{supabase_url}/rest/v1/notifications",
+                f"{supabase_url}/rest/v1/rpc/create_notification",
                 json={
-                    "user_id": requester_id,
-                    "title": "Yêu cầu tham gia đã được chấp nhận",
-                    "body": "Yêu cầu tham gia đã được chấp nhận",
-                    "read": False,
-                    "related_slot_id": slot_id,
+                    "p_user_id": requester_id,
+                    "p_title": "Yêu cầu tham gia đã được chấp nhận",
+                    "p_body": "Yêu cầu tham gia đã được chấp nhận",
+                    "p_related_slot_id": slot_id,
                 },
-                headers=headers,
+                headers=user_headers(user.token, prefer=None),
                 timeout=5,
             )
         except Exception:
@@ -2641,8 +2639,8 @@ class SlotJoinRequestRejectView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         join_request, err = _resolve_join_request_owner(
             supabase_url, headers, join_request_id, user.id
@@ -2687,16 +2685,17 @@ class SlotJoinRequestRejectView(View):
 
         # Fire-and-forget notification to requester
         try:
+            # Cross-user notification (owner → requester): use the SECURITY
+            # DEFINER create_notification RPC (see approve view for rationale).
             requests.post(
-                f"{supabase_url}/rest/v1/notifications",
+                f"{supabase_url}/rest/v1/rpc/create_notification",
                 json={
-                    "user_id": requester_id,
-                    "title": "Yêu cầu tham gia bị từ chối",
-                    "body": "Yêu cầu tham gia bị từ chối",
-                    "read": False,
-                    "related_slot_id": slot_id,
+                    "p_user_id": requester_id,
+                    "p_title": "Yêu cầu tham gia bị từ chối",
+                    "p_body": "Yêu cầu tham gia bị từ chối",
+                    "p_related_slot_id": slot_id,
                 },
-                headers=headers,
+                headers=user_headers(user.token, prefer=None),
                 timeout=5,
             )
         except Exception:
@@ -2756,8 +2755,8 @@ class SlotParticipantsView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # Verify slot exists
         try:
@@ -2881,8 +2880,8 @@ class SlotJoinStatusView(View):
         # user_id param defaults to the authenticated caller
         target_user_id = request.GET.get("user_id") or user.id
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # Verify slot exists
         try:
@@ -2985,8 +2984,8 @@ class CourtSettingsView(View):
                 {"error": "auto_approve_single must be a boolean."}, status=400
             )
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
         courts_url = f"{supabase_url}/rest/v1/courts"
 
         # --- Fetch court (verify existence + ownership) ---
@@ -3082,8 +3081,8 @@ class SlotLastMinuteView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # --- Fetch slot ---
         slots_url = f"{supabase_url}/rest/v1/slots"
@@ -3276,8 +3275,8 @@ class OpenSlotsForJoinView(View):
 
         sport = request.GET.get("sport")
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = anon_headers()
 
         # --- Fetch approved courts ---
         courts_url = f"{supabase_url}/rest/v1/courts"

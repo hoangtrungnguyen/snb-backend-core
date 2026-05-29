@@ -137,7 +137,7 @@ class IsCourtOwner(BasePermission):
 
         # --- 3. Fetch court from Supabase REST API ---
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
 
         # URL-encode the court_id to prevent query injection
         encoded_court_id = quote(str(court_id), safe="")
@@ -214,7 +214,7 @@ class IsSeriesOwner(BasePermission):
         user_id = getattr(request.user, "id", None)
 
         supabase_url = getattr(settings, "SUPABASE_URL", "")
-        anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
+        anon_key = getattr(settings, "SUPABASE_PUBLISHABLE_KEY", "")
         headers = {
             "apikey": anon_key,
             "Authorization": f"Bearer {anon_key}",

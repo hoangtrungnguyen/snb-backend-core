@@ -35,10 +35,20 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # ------------------------------------------------------------------
-    # Ensure pg_cron extension is enabled
-    # (no-op if already present; requires superuser on the DB cluster)
+    # Ensure pg_cron extension is enabled — skip silently if unavailable
+    # (Supabase only allows pg_cron in the cron.database_name database)
     # ------------------------------------------------------------------
-    op.execute("CREATE EXTENSION IF NOT EXISTS pg_cron")
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            CREATE EXTENSION IF NOT EXISTS pg_cron;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'pg_cron not available in this database, skipping: %', SQLERRM;
+        END;
+        $$
+        """
+    )
 
     # ------------------------------------------------------------------
     # mark_reminder_candidates() — identify bookings in the T-60 window
@@ -95,20 +105,31 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     op.execute(
         """
-        SELECT cron.schedule(
-            'reminder-candidates-every-5min',
-            '*/5 * * * *',
-            $$SELECT mark_reminder_candidates()$$
-        )
+        DO $$
+        BEGIN
+            PERFORM cron.schedule(
+                'reminder-candidates-every-5min',
+                '*/5 * * * *',
+                'SELECT mark_reminder_candidates()'
+            );
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'pg_cron schedule skipped: %', SQLERRM;
+        END;
+        $$
         """
     )
 
 
 def downgrade() -> None:
-    # Remove the cron job first, then drop the function
     op.execute(
-        "SELECT cron.unschedule('reminder-candidates-every-5min')"
+        """
+        DO $$
+        BEGIN
+            PERFORM cron.unschedule('reminder-candidates-every-5min');
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'pg_cron unschedule skipped: %', SQLERRM;
+        END;
+        $$
+        """
     )
-    op.execute(
-        "DROP FUNCTION IF EXISTS mark_reminder_candidates()"
-    )
+    op.execute("DROP FUNCTION IF EXISTS mark_reminder_candidates()")

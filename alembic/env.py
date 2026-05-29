@@ -28,8 +28,19 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Override sqlalchemy.url from DATABASE_URL environment variable when present.
-_db_url = os.environ.get("DATABASE_URL")
+# Build DB URL from individual vars when DATABASE_HOST is set (mirrors Django settings),
+# otherwise fall back to DATABASE_URL.
+_db_host = os.environ.get("DATABASE_HOST")
+if _db_host:
+    _db_url = "postgresql://{}:{}@{}:{}/{}".format(
+        os.environ.get("DATABASE_USER", ""),
+        os.environ.get("DATABASE_PASSWORD", ""),
+        _db_host,
+        os.environ.get("DATABASE_PORT", "5432"),
+        os.environ.get("DATABASE_NAME", "postgres"),
+    )
+else:
+    _db_url = os.environ.get("DATABASE_URL", "")
 if _db_url:
     config.set_main_option("sqlalchemy.url", _db_url)
 

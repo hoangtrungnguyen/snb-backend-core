@@ -17,7 +17,7 @@ import pytest
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "spb_core.settings")
 os.environ.setdefault("DJANGO_SECRET_KEY", "test-secret-key-for-pytest")
 os.environ.setdefault("SUPABASE_URL", "https://test.supabase.co")
-os.environ.setdefault("SUPABASE_ANON_KEY", "test-anon-key")
+os.environ.setdefault("SUPABASE_PUBLISHABLE_KEY", "test-anon-key")
 
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.test import APIRequestFactory

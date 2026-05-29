@@ -33,28 +33,17 @@ from django.views.decorators.csrf import csrf_exempt
 from requests import RequestException as _RequestException
 from rest_framework.exceptions import AuthenticationFailed
 
+from auth_ext.rest import user_headers
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _get_supabase_keys():
-    """Return (supabase_url, service_role_key) from Django settings."""
-    supabase_url = getattr(settings, "SUPABASE_URL", "")
-    anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-    service_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "") or anon_key
-    return supabase_url, service_key
-
-
-def _supabase_headers(key: str) -> dict:
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Prefer": "return=representation",
-    }
+def _rest_base() -> str:
+    """Base URL for Supabase REST calls."""
+    return getattr(settings, "SUPABASE_URL", "")
 
 
 def _authenticate_request(request):
@@ -85,7 +74,7 @@ def _authenticate_request(request):
 
     app_metadata = payload.get("app_metadata") or {}
     role = app_metadata.get("role") or "authenticated"
-    return SupabaseUser(uid=uid, role=role), token
+    return SupabaseUser(uid=uid, role=role, token=token), token
 
 
 def _require_authenticated(request):
@@ -144,7 +133,7 @@ def _format_slot_time(start_at: str, end_at: str) -> str:
 
 def _send_notification(
     supabase_url: str,
-    headers: dict,
+    user_token: str,
     *,
     user_id: str,
     title: str,
@@ -152,23 +141,24 @@ def _send_notification(
     related_booking_id: str | None = None,
     related_slot_id: str | None = None,
 ) -> None:
-    """Fire-and-forget notification insert. Silently ignores all errors."""
-    payload: dict = {
-        "user_id": user_id,
-        "title": title,
-        "body": body,
-        "read": False,
-    }
-    if related_booking_id:
-        payload["related_booking_id"] = related_booking_id
-    if related_slot_id:
-        payload["related_slot_id"] = related_slot_id
+    """Fire-and-forget notification create. Silently ignores all errors.
 
+    Runs in RLS mode (caller's JWT) via the ``create_notification`` SECURITY
+    DEFINER RPC. The RPC is required because notifications are routinely created
+    for a *different* user (e.g. a player's booking notifies the court owner),
+    which no ``user_id = auth.uid()`` INSERT policy could ever permit directly.
+    """
     try:
         requests.post(
-            f"{supabase_url}/rest/v1/notifications",
-            json=payload,
-            headers=headers,
+            f"{supabase_url}/rest/v1/rpc/create_notification",
+            json={
+                "p_user_id": user_id,
+                "p_title": title,
+                "p_body": body,
+                "p_related_booking_id": related_booking_id,
+                "p_related_slot_id": related_slot_id,
+            },
+            headers=user_headers(user_token, prefer=None),
             timeout=5,
         )
     except Exception:
@@ -281,8 +271,8 @@ class BookingCreateView(View):
         customer_phone = body.get("customer_phone") or ""
         notes = body.get("notes") or ""
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # -----------------------------------------------------------------------
         # Step 1: Fetch slot — SELECT (FOR UPDATE guard: read-then-write pattern
@@ -338,7 +328,7 @@ class BookingCreateView(View):
         # Fetch player info for display names in notifications
         # -----------------------------------------------------------------------
         player_row = _fetch_one(
-            f"{supabase_url}/rest/v1/users",
+            f"{supabase_url}/rest/v1/customers",
             params={"id": f"eq.{user.id}", "select": "id,full_name,email", "limit": "1"},
             headers=headers,
         )
@@ -409,7 +399,7 @@ class BookingCreateView(View):
             # Player: "Đặt sân thành công — [court] · [date] · [time]"
             _send_notification(
                 supabase_url,
-                headers,
+                user.token,
                 user_id=user.id,
                 title="Đặt sân thành công",
                 body=f"Đặt sân thành công — {court_name} · {slot_time_str}",
@@ -419,7 +409,7 @@ class BookingCreateView(View):
             # Owner: "Đặt sân mới tự động được duyệt — [player] · [slot]"
             _send_notification(
                 supabase_url,
-                headers,
+                user.token,
                 user_id=owner_id,
                 title="Đặt sân mới tự động được duyệt",
                 body=(
@@ -433,7 +423,7 @@ class BookingCreateView(View):
             # Owner: "Yêu cầu đặt sân mới từ [name]"
             _send_notification(
                 supabase_url,
-                headers,
+                user.token,
                 user_id=owner_id,
                 title="Yêu cầu đặt sân mới",
                 body=f"Yêu cầu đặt sân mới từ {effective_customer_name or user.id}",
@@ -488,8 +478,8 @@ class BookingListView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # Pagination params
         try:
@@ -610,8 +600,8 @@ class BookingDetailView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         booking = _fetch_one(
             f"{supabase_url}/rest/v1/bookings",
@@ -791,8 +781,8 @@ class ManualBookingView(View):
                     status=400,
                 )
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         start_iso = start_at.isoformat()
         end_iso = end_at.isoformat()
@@ -951,7 +941,7 @@ class ManualBookingView(View):
         display_name = customer_name or "khách"
         _send_notification(
             supabase_url,
-            headers,
+            user.token,
             user_id=user.id,
             title="Đặt sân thủ công thành công",
             body=(
@@ -1053,8 +1043,8 @@ class BookingStatusView(View):
                 status=400,
             )
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # -----------------------------------------------------------------------
         # Step 1: Fetch the booking
@@ -1211,7 +1201,7 @@ class BookingStatusView(View):
             notif_title, notif_body = notification_map[target_status]
             _send_notification(
                 supabase_url,
-                headers,
+                user.token,
                 user_id=booking_user_id,
                 title=notif_title,
                 body=notif_body,
@@ -1337,8 +1327,8 @@ class PriceEstimateView(View):
                 )
 
         # --- Fetch court ---
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         court = _fetch_one(
             f"{supabase_url}/rest/v1/courts",

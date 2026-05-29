@@ -117,13 +117,13 @@ class OwnerForgotPasswordViewTests(TestCase):
         self.assertEqual(posted_json.get("email"), "owner@example.com")
 
     def test_uses_anon_key_not_service_role(self):
-        """Request to Supabase must use SUPABASE_ANON_KEY in apikey header."""
+        """Request to Supabase must use SUPABASE_PUBLISHABLE_KEY in apikey header."""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {}
 
         with patch("auth_ext.views.requests.post", return_value=mock_resp) as mock_post:
-            with self.settings(SUPABASE_ANON_KEY="test-anon-key", SUPABASE_URL="https://proj.supabase.co"):
+            with self.settings(SUPABASE_PUBLISHABLE_KEY="test-anon-key", SUPABASE_URL="https://proj.supabase.co"):
                 self.client.post(
                     self.url,
                     data=json.dumps({"email": "owner@example.com"}),

@@ -60,7 +60,7 @@ def upgrade() -> None:
         SET search_path = public
         AS $$
         BEGIN
-            UPDATE users
+            UPDATE customers
             SET fcm_tokens = array_append(fcm_tokens, p_token)
             WHERE id = p_user_id
               AND NOT (p_token = ANY(fcm_tokens));
@@ -88,7 +88,7 @@ def upgrade() -> None:
         SET search_path = public
         AS $$
         BEGIN
-            UPDATE users
+            UPDATE customers
             SET fcm_tokens = array_remove(fcm_tokens, p_token)
             WHERE id = p_user_id;
         END;

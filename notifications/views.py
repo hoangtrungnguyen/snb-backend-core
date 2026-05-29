@@ -19,6 +19,8 @@ from rest_framework.exceptions import AuthenticationFailed
 
 from django.conf import settings
 
+from auth_ext.rest import user_headers
+
 _DEFAULT_PAGE = 1
 _DEFAULT_LIMIT = 20
 
@@ -55,7 +57,7 @@ def _authenticate_request(request):
     app_metadata = payload.get("app_metadata") or {}
     role = app_metadata.get("role") or "authenticated"
 
-    return SupabaseUser(uid=uid, role=role), token
+    return SupabaseUser(uid=uid, role=role, token=token), token
 
 
 def _get_auth_user(request):
@@ -77,21 +79,8 @@ def _get_auth_user(request):
     return user, None
 
 
-def _get_supabase_keys():
-    supabase_url = getattr(settings, "SUPABASE_URL", "")
-    anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-    service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "") or anon_key
-    return supabase_url, service_role_key
-
-
-def _supabase_headers(service_role_key: str) -> dict:
-    return {
-        "apikey": service_role_key,
-        "Authorization": f"Bearer {service_role_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Prefer": "return=representation",
-    }
+def _rest_base() -> str:
+    return getattr(settings, "SUPABASE_URL", "")
 
 
 def _format_notification(row: dict) -> dict:
@@ -140,9 +129,9 @@ class NotificationsListView(View):
 
         offset = (page - 1) * limit
 
-        supabase_url, service_role_key = _get_supabase_keys()
+        supabase_url = _rest_base()
         notif_endpoint = f"{supabase_url}/rest/v1/notifications"
-        headers = _supabase_headers(service_role_key)
+        headers = user_headers(user.token)
         # Use Supabase range-based pagination
         headers["Range"] = f"{offset}-{offset + limit - 1}"
         headers["Range-Unit"] = "items"
@@ -196,9 +185,9 @@ class NotificationsMarkReadView(View):
         if err is not None:
             return err
 
-        supabase_url, service_role_key = _get_supabase_keys()
+        supabase_url = _rest_base()
         notif_endpoint = f"{supabase_url}/rest/v1/notifications"
-        headers = _supabase_headers(service_role_key)
+        headers = user_headers(user.token)
 
         try:
             resp = requests.patch(
@@ -240,10 +229,9 @@ class NotificationsReadAllView(View):
         if err is not None:
             return err
 
-        supabase_url, service_role_key = _get_supabase_keys()
+        supabase_url = _rest_base()
         notif_endpoint = f"{supabase_url}/rest/v1/notifications"
-        # Use minimal prefer to avoid returning the full rows (performance)
-        headers = _supabase_headers(service_role_key)
+        headers = user_headers(user.token)
         headers["Prefer"] = "return=minimal"
 
         try:

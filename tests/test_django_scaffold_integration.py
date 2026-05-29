@@ -197,8 +197,8 @@ class TestEnvExampleIntegration:
         "SECRET_KEY",
         "DATABASE_URL",
         "SUPABASE_URL",
-        "SUPABASE_ANON_KEY",
-        "SUPABASE_SERVICE_ROLE_KEY",
+        "SUPABASE_PUBLISHABLE_KEY",
+        "SUPABASE_SECRET_KEY",
         "SUPABASE_JWKS_URL",
         "SUPABASE_JWT_AUDIENCE",
     ]

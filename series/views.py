@@ -56,6 +56,8 @@ from django.views.decorators.csrf import csrf_exempt
 from requests import RequestException as _RequestException
 from rest_framework.exceptions import AuthenticationFailed
 
+from auth_ext.rest import user_headers
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -76,22 +78,9 @@ _MAX_RANGE_DAYS = 365   # max 365 days look-ahead for until_date
 # ---------------------------------------------------------------------------
 
 
-def _get_supabase_keys():
-    """Return (supabase_url, service_role_key) from Django settings."""
-    supabase_url = getattr(settings, "SUPABASE_URL", "")
-    anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-    service_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "") or anon_key
-    return supabase_url, service_key
-
-
-def _supabase_headers(key: str) -> dict:
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Prefer": "return=representation",
-    }
+def _rest_base() -> str:
+    """Base URL for Supabase REST calls."""
+    return getattr(settings, "SUPABASE_URL", "")
 
 
 def _authenticate_request(request):
@@ -122,7 +111,7 @@ def _authenticate_request(request):
 
     app_metadata = payload.get("app_metadata") or {}
     role = app_metadata.get("role") or "authenticated"
-    return SupabaseUser(uid=uid, role=role), token
+    return SupabaseUser(uid=uid, role=role, token=token), token
 
 
 def _require_authenticated(request):
@@ -181,7 +170,7 @@ def _fetch_list(url: str, params: dict, headers: dict):
 
 def _send_notification(
     supabase_url: str,
-    headers: dict,
+    user_token: str,
     *,
     user_id: str,
     title: str,
@@ -190,25 +179,25 @@ def _send_notification(
     related_slot_id: str | None = None,
     related_series_id: str | None = None,
 ) -> None:
-    """Fire-and-forget notification insert. Silently ignores all errors."""
-    payload: dict = {
-        "user_id": user_id,
-        "title": title,
-        "body": body,
-        "read": False,
-    }
-    if related_booking_id:
-        payload["related_booking_id"] = related_booking_id
-    if related_slot_id:
-        payload["related_slot_id"] = related_slot_id
-    if related_series_id:
-        payload["related_series_id"] = related_series_id
+    """Fire-and-forget notification create. Silently ignores all errors.
 
+    Runs in RLS mode (caller's JWT) via the ``create_notification`` SECURITY
+    DEFINER RPC — required because a series approval/cancellation notifies the
+    *player* (a different user from the acting owner), which no
+    ``user_id = auth.uid()`` INSERT policy could permit directly.
+    """
     try:
         requests.post(
-            f"{supabase_url}/rest/v1/notifications",
-            json=payload,
-            headers=headers,
+            f"{supabase_url}/rest/v1/rpc/create_notification",
+            json={
+                "p_user_id": user_id,
+                "p_title": title,
+                "p_body": body,
+                "p_related_booking_id": related_booking_id,
+                "p_related_slot_id": related_slot_id,
+                "p_related_series_id": related_series_id,
+            },
+            headers=user_headers(user_token, prefer=None),
             timeout=5,
         )
     except Exception:
@@ -510,8 +499,8 @@ class BookingSeriesPreviewView(View):
         valid_from = parsed["valid_from"]
         end_condition = parsed["end_condition"]
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # --- Fetch court ---
         court = _fetch_one(
@@ -678,8 +667,8 @@ class BookingSeriesCreateView(View):
             return JsonResponse({"error": "skipped_dates must be a list."}, status=400)
         skipped_dates = set(str(d).strip() for d in skipped_dates_raw)
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # --- Fetch court ---
         court = _fetch_one(
@@ -905,7 +894,7 @@ class BookingSeriesCreateView(View):
         pattern_display = "{} · {}".format(pattern, ", ".join(days_of_week))
         _send_notification(
             supabase_url,
-            headers,
+            user.token,
             user_id=owner_id,
             title="Yeu cau lich co dinh moi",
             body=(
@@ -999,8 +988,8 @@ class BookingSeriesDetailView(View):
         if err is not None:
             return err
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # --- Fetch series ---
         series = _fetch_one(
@@ -1210,8 +1199,8 @@ class BookingSeriesStatusView(View):
                 status=400,
             )
 
-        supabase_url, service_key = _get_supabase_keys()
-        headers = _supabase_headers(service_key)
+        supabase_url = _rest_base()
+        headers = user_headers(user.token)
 
         # --- Fetch series ---
         series = _fetch_one(
@@ -1367,7 +1356,7 @@ class BookingSeriesStatusView(View):
             # Notify player: series approved
             _send_notification(
                 supabase_url,
-                headers,
+                user.token,
                 user_id=series_user_id,
                 title="Lịch cố định đã được duyệt",
                 body=(
@@ -1383,7 +1372,7 @@ class BookingSeriesStatusView(View):
                 # Owner-initiated cancel: notify player
                 _send_notification(
                     supabase_url,
-                    headers,
+                    user.token,
                     user_id=series_user_id,
                     title="Lịch cố định bị huỷ",
                     body=f"Lịch cố định của bạn tại {court_name} đã bị huỷ bởi chủ sân.",
@@ -1393,7 +1382,7 @@ class BookingSeriesStatusView(View):
                 # Player-initiated cancel: notify owner
                 _send_notification(
                     supabase_url,
-                    headers,
+                    user.token,
                     user_id=court_owner_id,
                     title="Lịch cố định bị huỷ",
                     body=f"Lịch cố định tại {court_name} đã bị huỷ bởi người chơi.",
@@ -1403,7 +1392,7 @@ class BookingSeriesStatusView(View):
                 # Both roles (owner is also the series player) — notify player
                 _send_notification(
                     supabase_url,
-                    headers,
+                    user.token,
                     user_id=series_user_id,
                     title="Lịch cố định bị huỷ",
                     body=f"Lịch cố định của bạn tại {court_name} đã bị huỷ.",

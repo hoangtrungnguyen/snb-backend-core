@@ -83,8 +83,8 @@ def _make_update_response():
 
 @override_settings(
     SUPABASE_URL="https://xyzproject.supabase.co",
-    SUPABASE_ANON_KEY="anon-key-test",
-    SUPABASE_SERVICE_ROLE_KEY="service-role-key-test",
+    SUPABASE_PUBLISHABLE_KEY="anon-key-test",
+    SUPABASE_SECRET_KEY="service-role-key-test",
     FRONTEND_URL="https://app.example.com",
     ALLOWED_HOSTS=["testserver", "localhost"],
 )

@@ -8,6 +8,7 @@ and override as needed.
 from pathlib import Path
 
 import environ
+from django.core.exceptions import ImproperlyConfigured
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -177,7 +178,32 @@ REST_FRAMEWORK = {
 # ---------------------------------------------------------------------------
 
 SUPABASE_URL = env.str("SUPABASE_URL", default="")
-SUPABASE_ANON_KEY = env.str("SUPABASE_ANON_KEY", default="") or env.str("SUPABASE_KEY", default="")
-SUPABASE_SERVICE_ROLE_KEY = env.str("SUPABASE_SERVICE_ROLE_KEY", default="") or SUPABASE_ANON_KEY
+
+# Supabase API keys — new key model.
+# https://supabase.com/docs/guides/getting-started/api-keys
+#   SUPABASE_PUBLISHABLE_KEY (sb_publishable_…) — user-facing requests; PostgREST
+#                                                 enforces RLS as the bearer's JWT.
+#   SUPABASE_SECRET_KEY      (sb_secret_…)      — backend/background jobs; bypasses RLS.
+# Both are REQUIRED with no fallback. The app refuses to start if either is
+# missing or empty.
+SUPABASE_PUBLISHABLE_KEY = env.str("SUPABASE_PUBLISHABLE_KEY", default="")
+SUPABASE_SECRET_KEY = env.str("SUPABASE_SECRET_KEY", default="")
+
+_missing_supabase_keys = [
+    name
+    for name, value in (
+        ("SUPABASE_PUBLISHABLE_KEY", SUPABASE_PUBLISHABLE_KEY),
+        ("SUPABASE_SECRET_KEY", SUPABASE_SECRET_KEY),
+    )
+    if not value
+]
+if _missing_supabase_keys:
+    raise ImproperlyConfigured(
+        "Missing required Supabase API key(s): "
+        + ", ".join(_missing_supabase_keys)
+        + ". Set them in the environment (new key model: "
+        "SUPABASE_PUBLISHABLE_KEY=sb_publishable_…, SUPABASE_SECRET_KEY=sb_secret_…)."
+    )
+
 _default_jwks = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else ""
 SUPABASE_JWKS_URL = env.str("SUPABASE_JWKS_URL", default=_default_jwks)

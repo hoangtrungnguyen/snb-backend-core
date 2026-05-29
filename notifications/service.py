@@ -31,8 +31,7 @@ logger = logging.getLogger(__name__)
 def _get_supabase_keys():
     """Return (supabase_url, service_role_key)."""
     supabase_url = getattr(settings, "SUPABASE_URL", "")
-    anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-    service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "") or anon_key
+    service_role_key = settings.SUPABASE_SECRET_KEY
     return supabase_url, service_role_key
 
 
@@ -108,7 +107,7 @@ def dispatch_notification(
                  related_booking_id, related_series_id
        - Supabase Realtime automatically broadcasts INSERT to subscribed
          clients filtered by user_id (grava-52bc.2.2 — no extra code needed).
-    2. Fetch recipient fcm_tokens from public.users.
+    2. Fetch recipient fcm_tokens from public.customers.
     3. Call _send_fcm_multicast (grava-52bc.2.3) — skipped if no tokens.
 
     Returns the inserted notification dict.
@@ -116,7 +115,7 @@ def dispatch_notification(
     """
     supabase_url, service_role_key = _get_supabase_keys()
     notif_endpoint = f"{supabase_url}/rest/v1/notifications"
-    users_endpoint = f"{supabase_url}/rest/v1/users"
+    users_endpoint = f"{supabase_url}/rest/v1/customers"
     headers = _supabase_headers(service_role_key)
 
     # ------------------------------------------------------------------

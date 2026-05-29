@@ -38,8 +38,7 @@ logger = logging.getLogger(__name__)
 def _get_supabase_keys():
     """Return (supabase_url, service_role_key)."""
     supabase_url = getattr(settings, "SUPABASE_URL", "")
-    anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-    service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "") or anon_key
+    service_role_key = settings.SUPABASE_SECRET_KEY
     return supabase_url, service_role_key
 
 
@@ -182,7 +181,7 @@ def send_booking_reminder(booking: dict) -> None:
     fcm_tokens: list[str] = []
     try:
         user_resp = requests.get(
-            f"{supabase_url}/rest/v1/users",
+            f"{supabase_url}/rest/v1/customers",
             params={"id": f"eq.{user_id}", "select": "id,fcm_tokens"},
             headers=headers,
             timeout=10,

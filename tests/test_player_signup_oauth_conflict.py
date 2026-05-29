@@ -27,8 +27,8 @@ from auth_ext.supabase_client import get_anon_client
 
 _TEST_SETTINGS = dict(
     SUPABASE_URL="https://test.supabase.co",
-    SUPABASE_ANON_KEY="test-anon-key",
-    SUPABASE_SERVICE_ROLE_KEY="test-service-role-key",
+    SUPABASE_PUBLISHABLE_KEY="test-anon-key",
+    SUPABASE_SECRET_KEY="test-service-role-key",
 )
 
 

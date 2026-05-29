@@ -14,9 +14,9 @@ from supabase import Client, create_client
 
 @lru_cache(maxsize=1)
 def get_anon_client() -> Client:
-    return create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
+    return create_client(settings.SUPABASE_URL, settings.SUPABASE_PUBLISHABLE_KEY)
 
 
 @lru_cache(maxsize=1)
 def get_admin_client() -> Client:
-    return create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+    return create_client(settings.SUPABASE_URL, settings.SUPABASE_SECRET_KEY)

@@ -9,7 +9,7 @@ AC:
 - Returns {"access_token": "...", "refresh_token": "...", "user": {...}} on success
 - Returns 401 {"error": "invalid_token"} on invalid/expired refresh token
 - Returns 400 on missing/malformed request body
-- Uses SUPABASE_ANON_KEY for the call
+- Uses SUPABASE_PUBLISHABLE_KEY for the call
 """
 import json
 import requests as requests_lib
@@ -93,11 +93,11 @@ class TokenRefreshViewTests(TestCase):
         self.assertEqual(posted_json.get("refresh_token"), "valid-refresh-token")
 
     def test_refresh_uses_supabase_anon_key_header(self):
-        """View must send SUPABASE_ANON_KEY in the apikey header."""
+        """View must send SUPABASE_PUBLISHABLE_KEY in the apikey header."""
         mock_resp = self._mock_supabase_success()
 
         with patch("auth_ext.views.requests.post", return_value=mock_resp) as mock_post:
-            with self.settings(SUPABASE_ANON_KEY="test-anon-key"):
+            with self.settings(SUPABASE_PUBLISHABLE_KEY="test-anon-key"):
                 self.client.post(
                     self.url,
                     data=json.dumps({"refresh_token": "valid-refresh-token"}),

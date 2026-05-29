@@ -60,9 +60,7 @@ def health(request):
 
 def _supabase_fetch(path, params=None):
     url = os.environ.get("SUPABASE_URL", "")
-    key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-           or os.environ.get("SUPABASE_ANON_KEY", "")
-           or os.environ.get("SUPABASE_KEY", ""))
+    key = os.environ.get("SUPABASE_SECRET_KEY", "")
     if not url or not key:
         return None, "Supabase not configured"
     try:
@@ -99,7 +97,7 @@ def _db_fetch(sql, cols):
 def dashboard(request):
     users, users_count = _db_fetch(
         "SELECT id, email, role, created_at, COUNT(*) OVER() AS _count "
-        "FROM public.users ORDER BY created_at DESC LIMIT 20",
+        "FROM public.customers ORDER BY created_at DESC LIMIT 20",
         ["id", "email", "role", "created_at", "_count"],
     )
     courts, courts_count = _db_fetch(

@@ -1,4 +1,4 @@
-"""handle_new_user trigger — auto-create public.users row on first Supabase signup.
+"""handle_new_user trigger — auto-create public.customers row on first Supabase signup.
 
 Revision ID: 0002
 Revises: 0001
@@ -9,9 +9,9 @@ Covers task:
                     with `role = player` (via `handle_new_user` trigger)
 
 When a new row is inserted into auth.users (Supabase auth schema), this
-trigger fires and inserts a corresponding row into public.users with
+trigger fires and inserts a corresponding row into public.customers with
 role = 'player'.  ON CONFLICT DO NOTHING ensures idempotency in case the
-public.users row already exists.
+public.customers row already exists.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ depends_on = None
 def upgrade() -> None:
     # ------------------------------------------------------------------
     # Function: handle_new_user
-    # Inserts a public.users row when auth.users gets a new signup.
+    # Inserts a public.customers row when auth.users gets a new signup.
     # ON CONFLICT DO NOTHING keeps the operation idempotent.
     # ------------------------------------------------------------------
     op.execute(
@@ -39,7 +39,7 @@ def upgrade() -> None:
         SECURITY DEFINER
         AS $$
         BEGIN
-            INSERT INTO public.users (id, role)
+            INSERT INTO public.customers (id, role)
             VALUES (NEW.id, 'player')
             ON CONFLICT DO NOTHING;
             RETURN NEW;

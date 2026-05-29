@@ -47,7 +47,7 @@ class PlayerForgotPasswordViewTests(TestCase):
         mock_resp.json.return_value = {}
         app_base_url = "https://api.sportbuddies.com"
         with patch("auth_ext.views.requests.post", return_value=mock_resp) as mock_post:
-            with self.settings(SUPABASE_URL="https://proj.supabase.co", SUPABASE_ANON_KEY="test-anon-key", APP_BASE_URL=app_base_url):
+            with self.settings(SUPABASE_URL="https://proj.supabase.co", SUPABASE_PUBLISHABLE_KEY="test-anon-key", APP_BASE_URL=app_base_url):
                 self.client.post(self.url, data=json.dumps({"email": "player@example.com"}), content_type="application/json")
         mock_post.assert_called_once()
         call_args = mock_post.call_args
