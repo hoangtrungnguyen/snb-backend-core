@@ -37,9 +37,12 @@ ENV DJANGO_SETTINGS_MODULE=spb_core.settings.prod \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Collect static for WhiteNoise. SECRET_KEY/ALLOWED_HOSTS/DATABASE_URL aren't
-# needed at collectstatic time, but prod settings require them — use dummies.
+# Collect static for WhiteNoise. prod settings require several env vars at
+# import time (incl. the Supabase keys, which raise ImproperlyConfigured if
+# unset) — supply dummies here. Real values are injected at runtime by Cloud Run.
 RUN SECRET_KEY=build-only ALLOWED_HOSTS=* DATABASE_URL=sqlite:///tmp/build.db \
+    SUPABASE_PUBLISHABLE_KEY=sb_publishable_build \
+    SUPABASE_SECRET_KEY=sb_secret_build \
     python manage.py collectstatic --noinput
 
 EXPOSE 8000
