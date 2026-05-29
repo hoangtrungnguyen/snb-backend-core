@@ -28,6 +28,9 @@ import math
 import time
 
 import requests
+from supabase_auth.errors import AuthApiError
+
+from auth_ext.supabase_client import get_admin_client, get_anon_client
 from django.core.cache import cache
 from django.conf import settings
 from django.http import JsonResponse, HttpResponseRedirect
@@ -52,7 +55,7 @@ class OwnerLoginView(View):
         supabase_url = getattr(settings, "SUPABASE_URL", "")
         service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
 
-        users_endpoint = f"{supabase_url}/rest/v1/users"
+        users_endpoint = f"{supabase_url}/rest/v1/customers"
 
         try:
             resp = requests.get(
@@ -389,72 +392,119 @@ class PlayerSignupView(View):
                 status=400,
             )
 
-        supabase_url = getattr(settings, "SUPABASE_URL", "")
-        supabase_anon_key = getattr(settings, "SUPABASE_ANON_KEY", "")
-        supabase_service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
-
-        signup_endpoint = f"{supabase_url}/auth/v1/signup"
-
         try:
-            supabase_resp = requests.post(
-                signup_endpoint,
-                json={"email": email, "password": password},
-                headers={
-                    "apikey": supabase_anon_key,
-                    "Content-Type": "application/json",
-                },
-                timeout=10,
+            auth_resp = get_anon_client().auth.sign_up(
+                {"email": email, "password": password}
             )
-        except requests.RequestException as exc:
-            logger.error("Network error reaching Supabase signup endpoint: %s", exc)
+        except AuthApiError as exc:
+            if exc.status == 422:
+                supabase_url = getattr(settings, "SUPABASE_URL", "")
+                service_role_key = getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", "")
+                if _check_google_oauth_provider(supabase_url, service_role_key, email):
+                    return JsonResponse(
+                        {"code": "account_exists_other_provider"},
+                        status=409,
+                    )
+                return JsonResponse(
+                    {"error": "email_already_registered"},
+                    status=409,
+                )
+            logger.error("Supabase signup error %s: %s", exc.status, exc.message)
+            return JsonResponse({"error": "Signup failed."}, status=503)
+        except Exception as exc:  # transport / unexpected
+            logger.error("Supabase signup transport error: %s", exc)
             return JsonResponse(
                 {"error": "Authentication service unavailable."},
                 status=502,
             )
 
-        if supabase_resp.status_code == 200:
-            data = supabase_resp.json()
-            return JsonResponse(
-                {
-                    "message": "Confirmation email sent",
-                    "user": {
-                        "id": data.get("id"),
-                        "email": data.get("email"),
-                    },
-                },
-                status=201,
-            )
-
-        # Supabase 422 means the email is already registered.
-        # Determine whether the existing account uses Google OAuth or email/password.
-        if supabase_resp.status_code == 422:
-            has_google = _check_google_oauth_provider(
-                supabase_url, supabase_service_role_key, email
-            )
-            if has_google:
-                return JsonResponse(
-                    {"code": "account_exists_other_provider"},
-                    status=409,
-                )
-            return JsonResponse(
-                {"error": "email_already_registered"},
-                status=409,
-            )
-
-        # Other Supabase errors — log server-side, return generic message
-        try:
-            error_data = supabase_resp.json()
-        except ValueError:
-            error_data = {}
-
-        logger.error(
-            "Supabase signup returned unexpected status %s: %s",
-            supabase_resp.status_code,
-            error_data,
-        )
+        user = auth_resp.user
         return JsonResponse(
-            {"error": "Signup failed."},
-            status=503,
+            {
+                "message": "Confirmation email sent",
+                "user": {
+                    "id": getattr(user, "id", None),
+                    "email": getattr(user, "email", email),
+                },
+            },
+            status=201,
+        )
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class OwnerSignupView(View):
+    """Handle POST /auth/owner/signup.
+
+    Creates an auto-confirmed Supabase auth user via the admin API and
+    promotes the corresponding `customers` row from the trigger-inserted
+    default role ``player`` to ``owner``.
+
+    Body: {"email": "...", "password": "..."}
+    Returns:
+        201 {"message": "Owner account created", "user": {"id", "email"}}
+        400 on invalid body, missing fields, or password rule violations
+        409 {"error": "email_already_registered"} when Supabase returns 422
+        502/503 on upstream auth/profile service failure
+    """
+
+    def post(self, request):
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        email = body.get("email")
+        password = body.get("password")
+
+        if not email:
+            return JsonResponse({"error": "email is required."}, status=400)
+        if not password:
+            return JsonResponse({"error": "password is required."}, status=400)
+
+        validation_errors = _validate_password(password)
+        if validation_errors:
+            return JsonResponse(
+                {"error": "validation_error", "detail": validation_errors},
+                status=400,
+            )
+
+        admin = get_admin_client()
+
+        try:
+            created = admin.auth.admin.create_user(
+                {"email": email, "password": password, "email_confirm": True}
+            )
+        except AuthApiError as exc:
+            if exc.status == 422:
+                return JsonResponse({"error": "email_already_registered"}, status=409)
+            logger.error(
+                "Supabase admin create_user error %s: %s", exc.status, exc.message
+            )
+            return JsonResponse({"error": "Signup failed."}, status=503)
+        except Exception as exc:
+            logger.error("Supabase admin create_user transport error: %s", exc)
+            return JsonResponse({"error": "Authentication service unavailable."}, status=502)
+
+        user = created.user
+        user_id = getattr(user, "id", None)
+        user_email = getattr(user, "email", email)
+
+        # Promote the customers row inserted by the handle_new_user trigger
+        # from default role='player' to 'owner'.
+        if user_id:
+            try:
+                admin.table("customers").update({"role": "owner"}).eq(
+                    "id", user_id
+                ).execute()
+            except Exception as exc:
+                logger.error("customers role update failed: %s", exc)
+                return JsonResponse(
+                    {"error": "User profile service unavailable."}, status=503
+                )
+
+        return JsonResponse(
+            {"message": "Owner account created", "user": {"id": user_id, "email": user_email}},
+            status=201,
         )
 
 
@@ -544,7 +594,7 @@ class AuthCallbackView(View):
                 "Authorization": f"Bearer {supabase_service_key}",
                 "Content-Type": "application/json",
             }
-            users_endpoint = f"{supabase_url}/rest/v1/users"
+            users_endpoint = f"{supabase_url}/rest/v1/customers"
 
             # ------------------------------------------------------------------
             # Step 2a: Look up existing users row by email to detect merge case.

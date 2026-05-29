@@ -33,9 +33,14 @@ COPY . .
 # ENV DJANGO_SETTINGS_MODULE is expected from the runtime environment (.env)
 # Fallback default so the image works standalone; override at runtime for prod
 # (e.g. DJANGO_SETTINGS_MODULE=spb_core.settings.prod once the settings split lands).
-ENV DJANGO_SETTINGS_MODULE=spb_core.settings \
+ENV DJANGO_SETTINGS_MODULE=spb_core.settings.prod \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+
+# Collect static for WhiteNoise. SECRET_KEY/ALLOWED_HOSTS/DATABASE_URL aren't
+# needed at collectstatic time, but prod settings require them — use dummies.
+RUN SECRET_KEY=build-only ALLOWED_HOSTS=* DATABASE_URL=sqlite:///tmp/build.db \
+    python manage.py collectstatic --noinput
 
 EXPOSE 8000
 

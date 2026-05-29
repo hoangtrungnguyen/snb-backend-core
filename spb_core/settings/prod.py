@@ -41,6 +41,20 @@ SECURE_HSTS_SECONDS = 31536000
 SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 SECURE_HSTS_PRELOAD = True
 SECURE_SSL_REDIRECT = True
+# Cloud Run / load balancers terminate TLS upstream and forward as HTTP with
+# X-Forwarded-Proto: https. Without this, SECURE_SSL_REDIRECT causes a redirect loop.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# ---------------------------------------------------------------------------
+# Static files via WhiteNoise (serves collected static from STATIC_ROOT)
+# ---------------------------------------------------------------------------
+MIDDLEWARE.insert(  # noqa: F405
+    1, "whitenoise.middleware.WhiteNoiseMiddleware"
+)
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
+}
 
 # ---------------------------------------------------------------------------
 # Database — DATABASE_URL must be set in env for production.
