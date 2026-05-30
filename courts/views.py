@@ -70,7 +70,7 @@ from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.exceptions import AuthenticationFailed
 
-from auth_ext.rest import anon_headers, user_headers
+from auth_ext.rest import admin_headers, anon_headers, user_headers
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2841,6 +2841,231 @@ class SlotParticipantsView(View):
             },
             status=200,
         )
+
+    def post(self, request, slot_id: str):
+        """
+        POST /api/slots/{id}/participants
+
+        Court owner adds a player to a slot by roster. Bypasses the join-request
+        flow — the participant row is inserted directly with admin (service_role)
+        privileges so that RLS does not block the operation.
+
+        Request body (JSON) — one of:
+          { "user_id": "<uuid>" }                     — existing customer
+          { "name": "<str>", "phone": "<str>" }       — look up or upsert customer
+
+        Responses:
+          201 — {"participant": {...}, "warning": "over_capacity"?}
+          400 — missing / invalid body
+          401 — no/invalid token
+          403 — not an owner; or court not owned by caller
+          404 — slot or customer not found
+          409 — player already a participant
+          503 — upstream error
+
+        BCORE-304
+        """
+        user, err = _require_owner(request)
+        if err is not None:
+            return err
+
+        # --- Parse body ---
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        user_id_param = body.get("user_id")
+        name_param = (body.get("name") or "").strip()
+        phone_param = (body.get("phone") or "").strip()
+
+        if not user_id_param and not name_param and not phone_param:
+            return JsonResponse(
+                {"error": "Provide 'user_id' or at least 'name' / 'phone'."},
+                status=400,
+            )
+
+        supabase_url = _rest_base()
+        a_headers = admin_headers()
+
+        # --- Fetch slot ---
+        try:
+            slot_resp = requests.get(
+                f"{supabase_url}/rest/v1/slots",
+                params={"id": f"eq.{slot_id}", "select": "id,court_id,max_players", "limit": "1"},
+                headers=a_headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        if slot_resp.status_code != 200:
+            return JsonResponse({"error": "Slot service unavailable."}, status=503)
+
+        slot_rows = slot_resp.json()
+        if not slot_rows:
+            return JsonResponse({"error": "Slot not found."}, status=404)
+
+        slot = slot_rows[0]
+
+        # --- Verify court ownership ---
+        try:
+            court_resp = requests.get(
+                f"{supabase_url}/rest/v1/courts",
+                params={"id": f"eq.{slot['court_id']}", "select": "id,owner_id", "limit": "1"},
+                headers=a_headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        if court_resp.status_code != 200:
+            return JsonResponse({"error": "Court service unavailable."}, status=503)
+
+        court_rows = court_resp.json()
+        if not court_rows or court_rows[0].get("owner_id") != user.id:
+            return JsonResponse(
+                {"error": "You do not have permission to add participants to this slot."},
+                status=403,
+            )
+
+        # --- Resolve customer UUID ---
+        customer_id: str | None = None
+
+        if user_id_param:
+            try:
+                cust_resp = requests.get(
+                    f"{supabase_url}/rest/v1/customers",
+                    params={"id": f"eq.{user_id_param}", "select": "id", "limit": "1"},
+                    headers=a_headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                return JsonResponse({"error": "Customer service unavailable."}, status=503)
+
+            if cust_resp.status_code != 200:
+                return JsonResponse({"error": "Customer service unavailable."}, status=503)
+
+            cust_rows = cust_resp.json()
+            if not cust_rows:
+                return JsonResponse({"error": "Customer not found."}, status=404)
+
+            customer_id = cust_rows[0]["id"]
+
+        else:
+            # Search by phone (more unique) then name
+            search_params: dict = {"select": "id,full_name,phone", "limit": "1"}
+            if phone_param:
+                search_params["phone"] = f"eq.{phone_param}"
+            else:
+                search_params["full_name"] = f"eq.{name_param}"
+
+            try:
+                search_resp = requests.get(
+                    f"{supabase_url}/rest/v1/customers",
+                    params=search_params,
+                    headers=a_headers,
+                    timeout=10,
+                )
+            except _RequestException:
+                return JsonResponse({"error": "Customer service unavailable."}, status=503)
+
+            if search_resp.status_code != 200:
+                return JsonResponse({"error": "Customer service unavailable."}, status=503)
+
+            found = search_resp.json()
+            if found:
+                customer_id = found[0]["id"]
+            else:
+                # Upsert: create a lightweight customer row (no auth.users entry)
+                new_customer: dict = {}
+                if name_param:
+                    new_customer["full_name"] = name_param
+                if phone_param:
+                    new_customer["phone"] = phone_param
+
+                try:
+                    create_resp = requests.post(
+                        f"{supabase_url}/rest/v1/customers",
+                        json=new_customer,
+                        headers=admin_headers(prefer="return=representation"),
+                        timeout=10,
+                    )
+                except _RequestException:
+                    return JsonResponse({"error": "Customer service unavailable."}, status=503)
+
+                if create_resp.status_code not in (200, 201):
+                    return JsonResponse({"error": "Failed to create customer."}, status=503)
+
+                created = create_resp.json()
+                if not created:
+                    return JsonResponse({"error": "Failed to create customer."}, status=503)
+
+                customer_id = created[0]["id"] if isinstance(created, list) else created["id"]
+
+        # --- Check duplicate ---
+        try:
+            dup_resp = requests.get(
+                f"{supabase_url}/rest/v1/slot_participants",
+                params={"slot_id": f"eq.{slot_id}", "user_id": f"eq.{customer_id}", "select": "id", "limit": "1"},
+                headers=a_headers,
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if dup_resp.status_code == 200 and dup_resp.json():
+            return JsonResponse({"error": "Player is already a participant in this slot."}, status=409)
+
+        # --- Capacity check ---
+        max_players = slot.get("max_players")
+        warning: str | None = None
+        if max_players is not None:
+            try:
+                count_resp = requests.get(
+                    f"{supabase_url}/rest/v1/slot_participants",
+                    params={"slot_id": f"eq.{slot_id}", "select": "id"},
+                    headers=a_headers,
+                    timeout=10,
+                )
+                current_count = len(count_resp.json()) if count_resp.status_code == 200 else 0
+            except _RequestException:
+                current_count = 0
+
+            if current_count >= max_players:
+                warning = "over_capacity"
+
+        # --- Insert slot_participants row ---
+        try:
+            insert_resp = requests.post(
+                f"{supabase_url}/rest/v1/slot_participants",
+                json={"slot_id": slot_id, "user_id": customer_id, "payment_status": "unpaid"},
+                headers=admin_headers(prefer="return=representation"),
+                timeout=10,
+            )
+        except _RequestException:
+            return JsonResponse({"error": "Service unavailable."}, status=503)
+
+        if insert_resp.status_code not in (200, 201):
+            return JsonResponse({"error": "Failed to add participant."}, status=503)
+
+        inserted = insert_resp.json()
+        new_row = inserted[0] if isinstance(inserted, list) else inserted
+
+        response_body: dict = {
+            "participant": {
+                "id": new_row.get("id"),
+                "slot_id": new_row.get("slot_id"),
+                "user_id": new_row.get("user_id"),
+                "joined_at": new_row.get("joined_at"),
+                "payment_status": new_row.get("payment_status"),
+                "payment_method": new_row.get("payment_method"),
+            }
+        }
+        if warning:
+            response_body["warning"] = warning
+
+        return JsonResponse(response_body, status=201)
 
     def http_method_not_allowed(self, request, *args, **kwargs):
         return JsonResponse({"error": "Method not allowed."}, status=405)

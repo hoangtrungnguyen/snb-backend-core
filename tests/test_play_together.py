@@ -805,8 +805,8 @@ class TestSlotParticipants:
 
         assert resp.status_code == 404
 
-    def test_405_post_not_allowed(self):
-        """POST is not allowed on this endpoint."""
+    def test_post_empty_body_returns_400(self):
+        """POST is now handled (BCORE-304); empty body → 400 not 405."""
         client = Client()
         with patch("auth_ext.middleware._decode_token", side_effect=_mock_decode("", _OWNER_JWT)):
             resp = client.post(
@@ -815,7 +815,7 @@ class TestSlotParticipants:
                 content_type="application/json",
                 HTTP_AUTHORIZATION="Bearer test-token",
             )
-        assert resp.status_code == 405
+        assert resp.status_code == 400
 
 
 # ===========================================================================
